@@ -12,6 +12,12 @@
 - <e.g. src/roman.py (new)>
 - <e.g. README.md (usage section only)>
 
+## Parts (optional; fill only when you split the job)
+<!-- One bullet per independent piece: who owns which files, what it must provide. Only list parts that can be
+     built in parallel without editing the same file or co-designing an interface. 3+ parts (or 2 big ones) -> swarm. -->
+- <e.g. storage: todo/storage.py — load/save tasks as JSON; API: load(path) returns a list, save(path, tasks)>
+- <e.g. cli: todo/cli.py — argparse add/list/done using the storage API above>
+
 ## Out of scope (must NOT change)
 - <e.g. tests/ (acceptance tests are fixed by the reviewer)>
 - <e.g. public API of src/core.py>
