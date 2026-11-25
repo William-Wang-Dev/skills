@@ -361,19 +361,62 @@ def launch_round(job, d, prompt, conversation=None):
     job.save(d)
     if d.get("dry_run"):
         return rnd
-    log = open(job.dir / "runner.log", "a")
-    p = subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "_run", str(job.dir), str(n)],
-                         cwd=d["worktree"], stdin=subprocess.DEVNULL, stdout=log, stderr=log,
-                         start_new_session=True, close_fds=True)
-    rnd["runner_pid"] = p.pid
+    runner = [sys.executable, str(Path(__file__).resolve()), "_run", str(job.dir), str(n)]
+    launcher = pick_launcher(d.get("launcher", "auto"))
+    rnd["launcher"] = launcher
+    if launcher == "systemd":
+        # a transient user unit survives agent harnesses that kill every descendant when a tool call returns
+        unit = "agy-delegate-%s-%d-%s" % (re.sub(r"[^a-zA-Z0-9_-]", "_", job.name), n, os.urandom(3).hex())
+        envs = ["--setenv=%s=%s" % (k, v) for k, v in os.environ.items() if passthrough_env(k)]
+        hard = int(d["budget_min"] * 60 + d.get("grace_s", 120) + 120)
+        p = run(["systemd-run", "--user", "--collect", "--quiet", "--unit", unit, "--working-directory", d["worktree"],
+                 "-p", "RuntimeMaxSec=%d" % hard, "-p", "StandardOutput=append:%s" % (job.dir / "runner.log"),
+                 "-p", "StandardError=append:%s" % (job.dir / "runner.log")] + envs + runner, check=True)
+        rnd["unit"] = unit
+    else:
+        log = open(job.dir / "runner.log", "a")
+        p = subprocess.Popen(runner, cwd=d["worktree"], stdin=subprocess.DEVNULL, stdout=log, stderr=log,
+                             start_new_session=True, close_fds=True)
+        rnd["runner_pid"] = p.pid
     job.save(d)
     return rnd
+
+
+ENV_PASS = re.compile(r"^(PATH|HOME|USER|LOGNAME|SHELL|LANG|LC_\w+|TZ|TMPDIR|XDG_\w+|AGY_\w+|FAKE_AGY_\w+|GEMINI_\w+|"
+                      r"GOOGLE_\w+|PYTHON\w*|VIRTUAL_ENV|SSL_CERT_\w+|REQUESTS_CA_BUNDLE|NODE_EXTRA_CA_CERTS|"
+                      r"(HTTPS?|NO|ALL)_PROXY|(https?|no|all)_proxy)$")
+
+
+def passthrough_env(k):
+    return bool(ENV_PASS.match(k))
+
+
+def pick_launcher(pref):
+    pref = os.environ.get("AGY_DELEGATE_LAUNCHER") or pref or "auto"
+    if pref in ("systemd", "setsid"):
+        return pref
+    if shutil.which("systemd-run") and shutil.which("systemctl"):
+        try:
+            if subprocess.run(["systemctl", "--user", "show-environment"], capture_output=True, timeout=5).returncode == 0:
+                return "systemd"
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+    return "setsid"
+
+
+def runner_pid(job, rnd):
+    return rnd.get("runner_pid") or load_pid(job.rpath(rnd["n"], "runner.pid"))
 
 
 def cmd__run(a):
     """Internal: detached runner. Runs agy, enforces the time budget, records exit."""
     sdir = Path(a.state_dir)
     n = int(a.round)
+    try:
+        os.setsid()
+    except OSError:
+        pass
+    (sdir / ("round-%d.runner.pid" % n)).write_text(str(os.getpid()))
     d = load_json(sdir / "job.json")
     rnd = d["rounds"][n - 1]
     hard = d["budget_min"] * 60 + d.get("grace_s", 120)
@@ -434,12 +477,12 @@ def evaluate(job, d):
             fence.append(e.get("reason", ""))
     st["blocked_actions"] = [x.get("action") for x in denied] + ["fence: " + f for f in fence] + \
         [e for e in info["errors"] if "permission" in e.lower() or "denied" in e.lower()][:5]
-    if d.get("status_override") == "stopped" and not (ex is None and pid_alive(rnd.get("runner_pid"))):
+    if d.get("status_override") == "stopped" and not (ex is None and pid_alive(runner_pid(job, rnd))):
         state = "stopped"
     elif ex is None:
         if d.get("dry_run"):
             state = "dry-run"
-        elif not pid_alive(rnd.get("runner_pid")):
+        elif not pid_alive(runner_pid(job, rnd)) and not (now() - rnd["started"] < 15 and not runner_pid(job, rnd)):
             state = "failed"
             st["reason"] = "runner exited without recording a result (see runner.log)"
         elif st["elapsed_s"] > d["budget_min"] * 60:
@@ -571,7 +614,7 @@ def cmd_start(a):
         d = {"name": a.job, "repo": str(repo), "worktree": str(wt), "branch": branch, "base_commit": base,
              "base_ref": a.base, "model": a.model, "accept": a.accept, "allow_paths": a.allow or [],
              "protect": a.protect or [], "budget_min": a.budget, "stuck_min": a.stuck, "max_rounds": a.max_rounds,
-             "created": now(), "rounds": [], "grace_s": int(os.environ.get("AGY_DELEGATE_GRACE_S", "120")), "git_common_dir": str(common_dir(repo)), "dry_run": a.dry_run,
+             "created": now(), "rounds": [], "launcher": a.launcher, "grace_s": int(os.environ.get("AGY_DELEGATE_GRACE_S", "120")), "git_common_dir": str(common_dir(repo)), "dry_run": a.dry_run,
              "progress_tracked": bool(git(wt, "ls-files", PROGRESS).strip())}
         (job.dir / "spec.md").write_text(spec)
         save_json(job.dir / "settings.json", build_settings(d, a.permissions))
@@ -797,7 +840,9 @@ def cmd_accept(a):
 
 def kill_round(job, rnd):
     killed = False
-    for pid in (rnd.get("runner_pid"), load_pid(job.rpath(rnd["n"], "pid"))):
+    if rnd.get("unit"):
+        killed = run(["systemctl", "--user", "stop", rnd["unit"]], check=False).returncode == 0 or killed
+    for pid in (runner_pid(job, rnd), load_pid(job.rpath(rnd["n"], "pid"))):
         if pid and pid_alive(pid):
             try:
                 os.killpg(int(pid), signal.SIGTERM)
@@ -825,7 +870,7 @@ def cmd_stop(a):
     rnd = d["rounds"][-1]
     killed = kill_round(job, rnd)
     deadline = now() + 30
-    while now() < deadline and (pid_alive(rnd.get("runner_pid")) or pid_alive(load_pid(job.rpath(rnd["n"], "pid")))):
+    while now() < deadline and (pid_alive(runner_pid(job, rnd)) or pid_alive(load_pid(job.rpath(rnd["n"], "pid")))):
         time.sleep(0.5)
     d["status_override"] = "stopped"
     job.save(d)
@@ -913,6 +958,9 @@ def build_parser():
     p.add_argument("--base", default="HEAD", help="base ref for the worktree (default HEAD)")
     p.add_argument("--worktree", help="worktree path (default under ~/.local/state/agy-delegate/worktrees)")
     p.add_argument("--permissions", help="alternative permissions template JSON")
+    p.add_argument("--launcher", choices=["auto", "systemd", "setsid"], default="auto",
+                   help="how to detach agy: systemd-run --user (survives harnesses that kill child processes) or setsid; "
+                        "auto picks systemd when a user systemd is available (env AGY_DELEGATE_LAUNCHER overrides)")
     p.add_argument("--dry-run", action="store_true", help="set up everything but do not launch agy")
     p.set_defaults(fn=cmd_start)
 

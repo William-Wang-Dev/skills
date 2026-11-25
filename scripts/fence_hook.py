@@ -22,11 +22,12 @@ import re
 import sys
 import time
 
+G = r"\bgit\s+(?:-[cC]\s*\S+\s+|--\S+\s+)*"  # git plus global options such as -c k=v / -C dir
 DENY_COMMAND_PATTERNS = [
-    (r"\bgit\s+push\b", "git push is not allowed (the gate owns the branch)"),
-    (r"\bgit\s+remote\s+(add|set-url|rename|remove|rm)\b", "changing git remotes is not allowed"),
-    (r"\bgit\s+config\s+(--global|--system)\b", "changing global git config is not allowed"),
-    (r"\bgit\s+(commit|reset\s+--hard|rebase|checkout\s+-B|branch\s+-[dD]|tag)\b",
+    (G + r"push\b", "git push is not allowed (the gate owns the branch)"),
+    (G + r"remote\s+(add|set-url|rename|remove|rm)\b", "changing git remotes is not allowed"),
+    (G + r"config\s+(--global|--system)\b", "changing global git config is not allowed"),
+    (G + r"(commit|reset\s+--hard|rebase|checkout\s+-B|branch\s+-[dD]|tag)\b",
      "git history changes are not allowed; leave changes uncommitted for the gate"),
     (r"(^|[\s;&|(`$'\"])(curl|wget|ssh|scp|sftp|rsync|nc|ncat|telnet|ftp)\b", "network/remote tools are not allowed"),
     (r"(^|[\s;&|(`$'\"])(sudo|su|doas|pkexec)\b", "privilege escalation is not allowed"),

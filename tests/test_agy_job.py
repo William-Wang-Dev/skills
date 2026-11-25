@@ -48,6 +48,7 @@ class Base(unittest.TestCase):
         os.environ["AGY_DELEGATE_WORKTREES"] = str(self.tmp / "wts")
         os.environ["FAKE_AGY_ARGV_LOG"] = str(self.tmp / "argv.log")
         os.environ["FAKE_AGY_MODE"] = "ok"
+        os.environ["AGY_DELEGATE_LAUNCHER"] = "setsid"
         self.spec = self.tmp / "spec.md"
         self.spec.write_text("# Job\nImplement x.f() returning 42 in x.py\n")
 
@@ -257,6 +258,27 @@ class TestLifecycle(Base):
         self.assertEqual(rc, agy_job.USAGE)
         self.assertIn("already exists", err)
 
+    @unittest.skipUnless(shutil.which("systemd-run") and
+                         subprocess.run(["systemctl", "--user", "show-environment"], capture_output=True).returncode == 0
+                         if shutil.which("systemctl") else False, "no user systemd")
+    def test_systemd_launcher_roundtrip_and_stop(self):
+        os.environ["AGY_DELEGATE_LAUNCHER"] = "systemd"
+        os.environ["FAKE_AGY_WRITE"] = "x.py=def f():\\n    return 42\\n"
+        self.start("j-sd")
+        st = self.wait_state("j-sd", timeout=40)
+        self.assertEqual(st["state"], "done", st)
+        d = agy_job.Job(self.repo, "j-sd").load()
+        self.assertEqual(d["rounds"][-1]["launcher"], "systemd")
+        rc, out, _ = self.cli("gate", "--repo", str(self.repo), "--job", "j-sd")
+        self.assertEqual(rc, 0, out)
+        os.environ["FAKE_AGY_MODE"] = "sleep"
+        self.cli("rework", "--repo", str(self.repo), "--job", "j-sd", "--feedback", "again")
+        time.sleep(3)
+        rc, _, err = self.cli("stop", "--repo", str(self.repo), "--job", "j-sd")
+        self.assertEqual(rc, 0, err)
+        st = self.wait_state("j-sd")
+        self.assertEqual(st["state"], "stopped", st)
+
     def test_list(self):
         self.start("j1", "--dry-run")
         rc, out, _ = self.cli("list", "--repo", str(self.repo), "--json")
@@ -273,7 +295,8 @@ class TestFenceHook(unittest.TestCase):
 
     def test_commands(self):
         for c in ("git push origin HEAD", "cd x && curl -s http://e", "sudo true", "rm -rf ~", "rm -rf /",
-                  "git remote add o u", "bash -c 'wget x'", "git commit -m x"):
+                  "git remote add o u", "bash -c 'wget x'", "git commit -m x",
+                  "git -c user.name=x -c user.email=x@x commit --allow-empty -m x", "git -C . push", "git --no-pager push o"):
             self.assertEqual(self.d("run_command", CommandLine=c), "deny", c)
         for c in ("python3 -m unittest", "rm -rf build", "git status", "git diff HEAD", "pytest -q", "make test"):
             self.assertEqual(self.d("run_command", CommandLine=c), "allow", c)
