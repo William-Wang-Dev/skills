@@ -36,7 +36,7 @@ If members disagree on the verdict or on a fact that decides it, send each one t
 - Check the facts members rely on (run the command, read the file, test the claim) before weighing them. A confident tone or mutual agreement is not evidence.
 - **Don't average.** Judge which reasoning is better, and say why. A minority view with better evidence wins.
 - Attribute every point: "Claude (Opus): ...", "agy (Neon high): ...".
-- Write the report with `templates/report.md`: question, panel, agreements, disagreements with each side's reasoning, your decision and why, open questions / what would change it.
+- Write the report with `templates/report.md`: question, panel, agreements, disagreements with each side's reasoning, your decision and why, open questions / what would change it. `examples/sqlite-vs-json.md` is a real filled-in report.
 
 **Done when:** the report names a decision (or a concrete next experiment if the evidence is truly insufficient) and every claim in it is attributed or verified.
 
