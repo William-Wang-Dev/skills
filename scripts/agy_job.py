@@ -2,7 +2,7 @@
 """agy_job.py - delegate a self-contained coding job to Antigravity CLI (`agy`)
 and act as monitor + gate. Python 3 stdlib only; needs `git` and `agy`.
 
-Subcommands: start, status, gate, rework, accept, stop, cleanup, list.
+Subcommands: start, status, gate, diff, rework, accept, stop, cleanup, list.
 Run `agy_job.py <cmd> -h` for options.
 
 Layout per job (nothing is written into the user's tracked tree except the
@@ -207,7 +207,7 @@ def parse_stream(path):
                 info["tools"] += 1
                 ti = su.get("tool_info") or {}
                 params = ti.get("parameters") or {}
-                target = params.get("CommandLine") or params.get("TargetFile") or params.get("AbsolutePath") \
+                target = params.get("CommandLine") or params.get("TargetFile") or params.get("Path") or params.get("AbsolutePath") \
                     or params.get("DirectoryPath") or params.get("Query") or ""
                 desc = "%s %s" % (su.get("tool_name"), str(target)[:100])
                 if st == "ERROR":
@@ -295,14 +295,27 @@ def build_settings(d, template=None):
     if tpl is None:
         raise JobError("cannot read permissions template %s" % (template or TEMPLATES / "permissions.json"))
     raw = json.dumps({k: v for k, v in tpl.items() if not k.startswith("_")})
-    raw = raw.replace("{GIT_COMMON_DIR}", d["git_common_dir"]).replace("(~/", "(" + str(Path.home()) + "/")
-    return json.loads(raw)
+    # the Linux sandbox rejects non-absolute file rules ("deny .env: non-absolute file path"), so every
+    # read_file/write_file target is made absolute: ~ -> home, relative -> inside the job worktree
+    raw = raw.replace("{GIT_COMMON_DIR}", d["git_common_dir"]).replace("{WORKTREE}", d["worktree"])
+    raw = raw.replace("(~/", "(" + str(Path.home()) + "/")
+    data = json.loads(raw)
+
+    def absolutize(rule):
+        m = re.match(r"^(read_file|write_file)\((.*)\)$", rule)
+        if not m or m.group(2) in ("*", "") or m.group(2).startswith("/"):
+            return rule
+        return "%s(%s)" % (m.group(1), os.path.join(d["worktree"], m.group(2)).rstrip("/"))
+    for key in ("allow", "deny", "ask"):
+        if key in data.get("permissions", {}):
+            data["permissions"][key] = [absolutize(r) for r in data["permissions"][key]]
+    return data
 
 
 def install_hook(job, d):
     wt = Path(d["worktree"])
     hp = wt / HOOK_REL
-    entry = {"PreToolUse": [{"matcher": "run_command|write_to_file|replace_file_content|multi_replace_file_content|sed_file|notebook_edit",
+    entry = {"PreToolUse": [{"matcher": "*",
                              "hooks": [{"type": "command", "timeout": 15,
                                         "command": " ".join(shlex.quote(x) for x in [
                                             sys.executable, str(FENCE_HOOK), "--log", str(job.dir / "fence.log"),
@@ -417,7 +430,7 @@ def evaluate(job, d):
     fence = []
     for line in (job.dir / "fence.log").read_text().splitlines() if (job.dir / "fence.log").exists() else []:
         e = load_json_str(line)
-        if e.get("ts", 0) >= rnd["started"]:
+        if e.get("ts", 0) >= rnd["started"] and e.get("decision", "deny") == "deny":
             fence.append(e.get("reason", ""))
     st["blocked_actions"] = [x.get("action") for x in denied] + ["fence: " + f for f in fence] + \
         [e for e in info["errors"] if "permission" in e.lower() or "denied" in e.lower()][:5]
@@ -463,7 +476,7 @@ def evaluate(job, d):
     if pg.exists():
         st["progress"] = "\n".join(pg.read_text(errors="replace").splitlines()[:25])
     try:
-        st["changed_files"] = len(changed_files(d))
+        st["changed_files"] = len(deliverable_files(d))
     except JobError:
         st["changed_files"] = None
     if d.get("accepted"):
@@ -547,7 +560,7 @@ def cmd_start(a):
     branch = "agy/" + a.job
     if git(repo, "branch", "--list", branch).strip():
         raise JobError("branch %s already exists" % branch)
-    dirty = git(repo, "status", "--porcelain").strip()
+    dirty = git(repo, "status", "--porcelain", "--untracked-files=no").strip()
     wt = Path(a.worktree).expanduser().resolve() if a.worktree else worktree_base(repo) / a.job
     if wt.exists():
         raise JobError("worktree path already exists: %s" % wt)
@@ -627,6 +640,9 @@ def cmd_gate(a):
     if st["state"] in ("running", "stuck") and not a.force:
         raise JobError("job is still %s; wait, or `stop` it first (or --force)" % st["state"], NOTREADY)
     wt = Path(d["worktree"])
+    for c in a.add_accept or []:
+        if c not in d["accept"]:
+            d["accept"].append(c)
     res = {"job": job.name, "round": len(d["rounds"]), "agent_state": st["state"], "checks": []}
     viol = []
     # tamper / history checks
@@ -644,7 +660,8 @@ def cmd_gate(a):
     tracked_changed = set(git(wt, "diff", "--name-only", d["base_commit"]).splitlines())
     untracked = [p for p in files if p not in tracked_changed]
     if untracked:
-        res["diffstat"] += ("\n" if res["diffstat"] else "") + "\n".join(" %s (new, untracked)" % p for p in untracked)
+        res["diffstat"] += ("\n" if res["diffstat"] else "") + "\n".join(
+            " %s (new, untracked, %d lines)" % (p, count_lines(wt / p)) for p in untracked)
     allpass = True
     for c in d["accept"]:
         t0 = now()
@@ -683,6 +700,30 @@ def cmd_gate(a):
     return code
 
 
+def count_lines(p):
+    try:
+        return len(Path(p).read_bytes().splitlines())
+    except OSError:
+        return 0
+
+
+def cmd_diff(a):
+    """Full review diff vs base, including new untracked files (scratch/junk excluded)."""
+    job = Job(a.repo, a.job)
+    d = job.load()
+    wt = Path(d["worktree"])
+    files = deliverable_files(d)
+    tracked = [p for p in files if p in set(git(wt, "diff", "--name-only", d["base_commit"]).splitlines())]
+    out = git(wt, "diff", d["base_commit"], "--", *tracked) if tracked else ""
+    for p in sorted(set(files) - set(tracked)):
+        q = run(["git", "-C", str(wt), "diff", "--no-index", "--", "/dev/null", p], check=False)
+        out += q.stdout
+    if a.stat:
+        out = "\n".join("%s %s" % (s_, p) for p, s_ in sorted(files.items()))
+    sys.stdout.write(out if out.endswith("\n") or not out else out + "\n")
+    return OK
+
+
 def cmd_rework(a):
     job = Job(a.repo, a.job)
     d = job.load()
@@ -700,6 +741,9 @@ def cmd_rework(a):
         raise JobError("give --feedback or --feedback-file with concrete, checkable points")
     if a.budget:
         d["budget_min"] = a.budget
+    for c in a.add_accept or []:
+        if c not in d["accept"]:
+            d["accept"].append(c)
     cid = st.get("conversation_id")
     n = len(d["rounds"]) + 1
     prompt = REWORK.format(n=n, maxr=d["max_rounds"], wt=d["worktree"], feedback=fb.strip(),
@@ -882,13 +926,19 @@ def build_parser():
     p.add_argument("--timeout", type=int, default=900, help="seconds per acceptance command")
     p.add_argument("--tail", type=int, default=25, help="output lines kept per command")
     p.add_argument("--force", action="store_true", help="gate even if the agent is still running")
+    p.add_argument("--add-accept", action="append", help="add an acceptance command to the job (persisted)")
     p.add_argument("-v", "--verbose", action="store_true")
     p.set_defaults(fn=cmd_gate)
+
+    p = common(sub.add_parser("diff", help="print the full review diff vs base (incl. new files)"))
+    p.add_argument("--stat", action="store_true", help="only list changed deliverable files")
+    p.set_defaults(fn=cmd_diff)
 
     p = common(sub.add_parser("rework", help="send feedback to the same agy conversation"))
     p.add_argument("--feedback", help="concrete feedback text")
     p.add_argument("--feedback-file", help="file with feedback")
     p.add_argument("--budget", type=float, help="new time budget for this round, minutes")
+    p.add_argument("--add-accept", action="append", help="add an acceptance command the agent must also satisfy")
     p.add_argument("--force", action="store_true", help="exceed max rounds")
     p.set_defaults(fn=cmd_rework)
 

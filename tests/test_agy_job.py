@@ -134,6 +134,11 @@ class TestLifecycle(Base):
         settings = json.loads(Path(argv[argv.index("--settings") + 1]).read_text())
         self.assertIn("command(git push)", settings["permissions"]["deny"])
         self.assertNotIn("_comment", settings)
+        file_rules = [r for k in ("allow", "deny") for r in settings["permissions"][k] if r.startswith(("read_file(", "write_file("))]
+        self.assertTrue(file_rules)
+        for r in file_rules:  # sandbox rejects relative file rules
+            self.assertTrue(r.split("(", 1)[1].startswith("/"), r)
+        self.assertIn("write_file(%s/.env)" % self.wt(), settings["permissions"]["deny"])
         wt = self.wt()
         self.assertTrue((wt / ".agents" / "hooks.json").exists())
         rc, out, _ = self.cli("gate", "--repo", str(self.repo), "--job", "j1", "--json")
@@ -281,6 +286,11 @@ class TestFenceHook(unittest.TestCase):
         self.assertEqual(self.d("replace_file_content", TargetFile="/w/.agents/hooks.json"), "deny")
         self.assertEqual(self.d("write_to_file", TargetFile="/w/.env"), "deny")
         self.assertEqual(self.d("write_to_file", TargetFile="/home/u/.gemini/x/brain/c1/plan.md"), "allow")
+        # names/keys actually seen from agy 1.5.x in hook payloads
+        self.assertEqual(self.d("write_file", Path="/w/roman.py", Content="x"), "allow")
+        self.assertEqual(self.d("write_file", Path="/tmp/elsewhere.py", Content="x"), "deny")
+        self.assertEqual(self.d("write_file", Path="/w/.git/HEAD", Content="x"), "deny")
+        self.assertEqual(self.d("read_file", Path="/etc/hosts"), "allow")
 
     def test_main_io(self):
         p = subprocess.run([sys.executable, str(HERE.parent / "scripts" / "fence_hook.py")], text=True, capture_output=True,

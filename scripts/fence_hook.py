@@ -35,7 +35,12 @@ DENY_COMMAND_PATTERNS = [
 
 PROTECTED_PARTS = (".git", ".agents")
 SENSITIVE_NAMES = re.compile(r"(^|/)(\.env(\..*)?|id_rsa.*|id_ed25519.*|.*\.pem|.*\.key)$")
-WRITE_TOOLS = {"write_to_file", "replace_file_content", "multi_replace_file_content", "sed_file", "notebook_edit"}
+WRITE_TOOLS = {"write_to_file", "write_file", "replace_file_content", "multi_replace_file_content", "edit_file",
+               "sed_file", "notebook_edit"}
+
+
+def is_write_tool(name):
+    return name in WRITE_TOOLS or any(k in name for k in ("write", "replace", "edit", "sed_"))
 
 
 def decide(payload, root=None):
@@ -50,7 +55,7 @@ def decide(payload, root=None):
             if re.search(pat, cmd):
                 return "deny", "agy-delegate fence: " + reason
         return "allow", ""
-    if name in WRITE_TOOLS:
+    if is_write_tool(name) and not name.startswith("browser"):
         roots = [os.path.realpath(r) for r in ([root] if root else []) + list(payload.get("workspacePaths") or [])]
         art = payload.get("artifactDirectoryPath")
         art = os.path.realpath(os.path.expanduser(art)) if art else None
@@ -85,13 +90,13 @@ def main(argv=None):
     except Exception:
         payload = {}
     decision, reason = decide(payload, a.root)
-    if a.log and decision == "deny":
+    if a.log and (decision == "deny" or os.environ.get("AGY_DELEGATE_HOOK_DEBUG")):
         try:
             call = payload.get("toolCall") or {}
             with open(a.log, "a") as fh:
                 fh.write(json.dumps({"ts": time.time(), "tool": call.get("name"),
                                      "args": {k: str(v)[:300] for k, v in (call.get("args") or {}).items()},
-                                     "reason": reason}) + "\n")
+                                     "decision": decision, "reason": reason}) + "\n")
         except OSError:
             pass
     out = {"decision": decision}
