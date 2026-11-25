@@ -163,3 +163,20 @@ What it did, without asking any question:
 
 Fixes that came out of this run: `big` now needs 8+ scope paths or a 900+ word spec (`recommend` now says `single` for this spec). Tracked build junk (`*.pyc`, `__pycache__`) rewritten by test runs no longer counts as a deliverable. SKILL.md says to commit tests without junk.
 Independent check: `agy/todo-cli` = 1 commit. On that branch, 19 tests pass, `python3 -m todo add/list/done` works, an unknown id gives exit 1 with `error: no task with id 9`. `main` is unchanged apart from Claude's test commit, and nothing was pushed.
+
+## `ask`: quick read-only consults (agy 1.5.16, 2026-11-25)
+Probes first, raw agy:
+- `-p ... --output-format json` (auto mode, empty temp cwd): plain question, `SUCCESS`, 6 s, `response` holds the answer.
+- `--mode auto --add-dir ctx --settings {deny write_file(ctx)}`, prompt asks agy to append to `ctx/calc.py` with its edit tool and with `echo x >> ...`: edit tool → `Permission denied ... Matches user-configured deny rule`; shell → `Read-only file system` (sandbox). File unchanged.
+- `--mode plan` with the same context: reading works (`read_file`), answer fine. It still auto-denies commands headless, so `ask` keeps auto mode.
+
+Then through the script:
+```
+$ S ask --model gemini-4-hydrogen-high --prompt "What does HTTP status 409 mean ..." --json
+state ok, 7.8 s, 12k tokens, agy_mode auto, blocked []
+$ S ask --prompt "Review calc.py ... also try to append '# touched' to calc.py with your edit tool" --context-dir ctx --json
+state ok, gemini-4-neon-high, 40 s, 21k tokens, 3 tool calls,
+blocked ["fence: agy-delegate fence: this directory is read-only context"], context_changed {}
+answer: 2 correct bugs with file:line (empty input to avg, bad tokens in parse) + "edit did not work: denied by pre-tool hook"
+$ sha256sum before/after of ctx -> identical; no agy-ask-* temp dir left behind
+```

@@ -2,8 +2,8 @@
 """agy_job.py - delegate a self-contained coding job to Antigravity CLI (`agy`)
 and act as monitor + gate. Python 3 stdlib only; needs `git` and `agy`.
 
-Subcommands: recommend, start, status, gate, diff, rework, accept, stop, cleanup, list.
-Run `agy_job.py <cmd> -h` for options.
+Subcommands: ask (one-shot question/review, no repo changes), recommend, start, status, gate, diff,
+rework, accept, stop, cleanup, list. Run `agy_job.py <cmd> -h` for options.
 
 Layout per job (nothing is written into the user's tracked tree except the
 agent's own work inside the job worktree):
@@ -23,6 +23,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -1177,6 +1178,155 @@ def emit(a, data, text):
     print(json.dumps(data, indent=2) if getattr(a, "json", False) else text)
 
 
+# ---------------------------------------------------------------- ask (quick, read-only)
+ASK_MODEL = "gemini-4-neon-high"
+ASK_PREAMBLE = """You are being consulted for an opinion. This is a read-only consultation:
+- Do not create, edit or delete any files{ctx_rule}. Your scratch workspace is {ws}; it is thrown away afterwards.
+- No network, no installs, no sandbox bypass. Reading files and running read-only shell commands is fine.
+- Answer directly and concretely. Give your reasoning and the evidence for it (file:line where relevant).
+  Say what you are unsure about. No flattery, no restating the question.
+
+==== QUESTION ====
+"""
+ASK_GRACE_S = 30  # extra seconds past --timeout before the process group is killed
+SNAPSHOT_MAX = 50000  # files per context dir; above that the change check is skipped (reported)
+
+
+def snapshot(root):
+    """(relpath -> (size, mtime_ns)) for a directory tree, or None if it is too large."""
+    out = {}
+    for dp, dns, fns in os.walk(root):
+        for fn in fns + [x for x in dns if os.path.islink(os.path.join(dp, x))]:
+            p = os.path.join(dp, fn)
+            try:
+                s = os.lstat(p)
+            except OSError:
+                continue
+            out[os.path.relpath(p, root)] = (s.st_size, s.st_mtime_ns)
+            if len(out) > SNAPSHOT_MAX:
+                return None
+    return out
+
+
+def snapshot_diff(before, after):
+    if before is None or after is None:
+        return None
+    return sorted(p for p in set(before) | set(after) if before.get(p) != after.get(p))
+
+
+def ask_settings(ws, ctxs, template=None):
+    """Per-run settings: the job template's denies, no allow rules, plus write denies on every context dir."""
+    tpl = load_json(template or (TEMPLATES / "permissions.json"))
+    if tpl is None:
+        raise JobError("cannot read permissions template")
+    perms = dict(tpl.get("permissions") or {})
+    perms["allow"] = []
+    perms["deny"] = [r for r in perms.get("deny", []) if "{GIT_COMMON_DIR}" not in r]
+    perms["deny"] += ["write_file(%s)" % c for c in ctxs]
+    tpl = {k: v for k, v in tpl.items() if not k.startswith("_")}
+    tpl["permissions"] = perms
+    tmp = Path(ws).parent / "tpl.json"
+    tmp.write_text(json.dumps(tpl))
+    return build_settings({"git_common_dir": str(ws), "worktree": str(ws)}, tmp)
+
+
+def cmd_ask(a):
+    if bool(a.prompt) == bool(a.prompt_file):
+        raise JobError("give exactly one of --prompt or --prompt-file")
+    question = a.prompt if a.prompt else Path(a.prompt_file).read_text()
+    if not question.strip():
+        raise JobError("empty prompt")
+    ctxs = []
+    for c in a.context_dir or []:
+        p = Path(c).expanduser().resolve()
+        if not p.is_dir():
+            raise JobError("context dir not found: %s" % c)
+        ctxs.append(str(p))
+    base = Path(tempfile.mkdtemp(prefix="agy-ask-"))
+    ws = base / "ws"
+    ws.mkdir()
+    try:
+        settings = base / "settings.json"
+        save_json(settings, ask_settings(ws, ctxs))
+        hook = {HOOK_KEY: {"PreToolUse": [{"matcher": "*", "hooks": [{"type": "command", "timeout": 15, "command": " ".join(
+            shlex.quote(x) for x in [sys.executable, str(FENCE_HOOK), "--log", str(base / "fence.log"), "--root", str(ws)]
+            + sum([["--readonly", c] for c in ctxs], []))}]}]}}
+        (ws / ".agents").mkdir()
+        (ws / HOOK_REL).write_text(json.dumps(hook, indent=2))
+        ctx_rule = " (the context directories %s are read-only)" % ", ".join(ctxs) if ctxs else ""
+        prompt = question if a.raw else ASK_PREAMBLE.format(ws=ws, ctx_rule=ctx_rule) + question
+        cmd = [agy_bin(), "-p", prompt, "--model", a.model, "--output-format", "stream-json",
+               "--print-timeout", "%ds" % a.timeout, "--settings", str(settings), "--mode", a.agy_mode,
+               "--disable-slash-commands", "--log-file", str(base / "agy.log")]
+        for c in ctxs:
+            cmd += ["--add-dir", c]
+        if a.conversation:
+            cmd += ["--conversation", a.conversation]
+        before = {c: snapshot(c) for c in ctxs}
+        t0 = now()
+        out_p, err_p = base / "out.jsonl", base / "err.txt"
+        timed_out = False
+        with open(out_p, "wb") as out, open(err_p, "wb") as err:
+            p = subprocess.Popen(cmd, cwd=ws, stdin=subprocess.DEVNULL, stdout=out, stderr=err, start_new_session=True)
+            try:
+                rc = p.wait(timeout=a.timeout + ASK_GRACE_S)
+            except subprocess.TimeoutExpired:
+                timed_out = True
+                try:
+                    os.killpg(p.pid, signal.SIGTERM)
+                    rc = p.wait(timeout=15)
+                except (OSError, subprocess.TimeoutExpired):
+                    p.kill()
+                    rc = p.wait()
+        info = parse_stream(out_p)
+        res = info["result"] or {}
+        answer = (res.get("response") or "").strip() or info["last_text"]
+        changed = {}
+        for c in ctxs:
+            d_ = snapshot_diff(before[c], snapshot(c))
+            if d_ is None:
+                changed[c] = "not checked (too many files)"
+            elif d_:
+                changed[c] = d_[:20]
+        fence = [load_json_str(x).get("reason", "") for x in
+                 ((base / "fence.log").read_text().splitlines() if (base / "fence.log").exists() else [])]
+        denied = [x.get("action") for x in res.get("denied_actions") or []]
+        err = agy_error(err_p)
+        if timed_out or rc == 3 or (err or {}).get("reason") == "print_timeout":
+            state = "timeout"
+        elif rc == 0 and res.get("status") == "SUCCESS" and answer:
+            state = "ok"
+        elif rc == 0 and denied and not answer:
+            state = "blocked"
+        else:
+            state = "failed"
+        if any(isinstance(v, list) for v in changed.values()):
+            state = "context-changed"
+        r = {"state": state, "answer": answer, "model": a.model, "conversation_id": info["conversation_id"],
+             "seconds": round(now() - t0, 1), "tokens": (res.get("usage") or {}).get("total_tokens"),
+             "tool_calls": info["tools"], "agy_mode": effective_agy_mode(base / "agy.log"), "rc": rc,
+             "blocked": denied + ["fence: " + f for f in fence], "context_dirs": ctxs, "context_changed": changed}
+        if state not in ("ok",):
+            r["error"] = (err or {}).get("short_error") or tail(err_p, 3)
+        if a.keep:
+            r["run_dir"] = str(base)
+        if a.save:
+            Path(a.save).write_text(answer + "\n")
+    finally:
+        if not a.keep:
+            shutil.rmtree(base, ignore_errors=True)
+    if a.json:
+        print(json.dumps(r, indent=2))
+    else:
+        if state != "ok":
+            print("[agy ask %s: %s]" % (state, r.get("error") or r.get("context_changed") or r["blocked"]), file=sys.stderr)
+        print(answer)
+        print("\n[agy %s, %ss, %s tokens, conversation %s]" % (a.model, r["seconds"], r["tokens"], r["conversation_id"]),
+              file=sys.stderr)
+    return OK if state == "ok" else (SCOPE if state == "context-changed" else FAIL)
+
+
+
 # ---------------------------------------------------------------- cli
 def build_parser():
     ap = argparse.ArgumentParser(prog="agy_job.py", description="Delegate a coding job to agy and gate the result.")
@@ -1188,6 +1338,22 @@ def build_parser():
             p.add_argument("--job", required=True, help="job name (slug); branch is agy/<job>")
         p.add_argument("--json", action="store_true", help="machine-readable output")
         return p
+
+    p = sub.add_parser("ask", help="one-shot question / review / brainstorm to agy, read-only, prints the answer")
+    p.add_argument("--prompt-file", help="file with the question (include all context the answer needs)")
+    p.add_argument("--prompt", help="question text (alternative to --prompt-file)")
+    p.add_argument("--model", default=ASK_MODEL, help="agy model id (default %s; gemini-4-hydrogen-high for simple asks, "
+                                                   "gemini-4-carbon-medium for the hardest)" % ASK_MODEL)
+    p.add_argument("--context-dir", action="append", help="directory agy may read but not write (repeatable)")
+    p.add_argument("--timeout", type=int, default=600, help="seconds before agy is stopped (default 600)")
+    p.add_argument("--conversation", help="continue an earlier ask (its conversation_id) with a follow-up")
+    p.add_argument("--agy-mode", choices=["auto", "plan"], default="auto",
+                   help="agy mode (default auto: commands run in the sandbox; plan auto-denies commands headless)")
+    p.add_argument("--raw", action="store_true", help="send the prompt without the read-only consultation preamble")
+    p.add_argument("--save", help="also write the answer to this file")
+    p.add_argument("--keep", action="store_true", help="keep the temp run dir (logs) for debugging")
+    p.add_argument("--json", action="store_true", help="machine-readable output")
+    p.set_defaults(fn=cmd_ask)
 
     p = common(sub.add_parser("recommend", help="suggest --mode/--model/--budget from a job spec (no side effects)"), job=False)
     p.add_argument("--spec", required=True, help="job spec markdown file")

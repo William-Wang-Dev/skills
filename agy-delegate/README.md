@@ -1,6 +1,6 @@
 # agy-delegate
 
-A Claude Code skill for handing a big, self-contained coding job to [Google Antigravity CLI](https://antigravity.google) (`agy`) while Claude acts only as **monitor and gate**. Claude picks the run mode itself: a single agent (Hydrogen, Neon or an Orchestrator model) or an agy `/swarm` of parallel workers plus a verifier for jobs that split into independent parts. agy works in an isolated git worktree on branch `agy/<job>`, with per-job permission rules and a fence hook. Claude re-runs the acceptance checks itself, reviews the diff, and accepts the result or sends rework into the same agy conversation.
+A Claude Code skill for using [Google Antigravity CLI](https://antigravity.google) (`agy`) as a helper: a **quick read-only ask** (second opinion, review, brainstorm) or a big, self-contained coding job where Claude acts only as **monitor and gate**. Claude picks the run mode itself: a single agent (Hydrogen, Neon or an Orchestrator model) or an agy `/swarm` of parallel workers plus a verifier for jobs that split into independent parts. agy works in an isolated git worktree on branch `agy/<job>`, with per-job permission rules and a fence hook. Claude re-runs the acceptance checks itself, reviews the diff, and accepts the result or sends rework into the same agy conversation.
 
 ## Install
 ```sh
@@ -17,7 +17,15 @@ Claude Code discovers it via `SKILL.md`. Nothing else needs installing.
 - Linux or macOS. The terminal sandbox needs unprivileged user namespaces on Linux (`unshare -Urn true` must work).
 - Optional: user-level systemd (`systemd-run --user`). With it, the detached agy run survives agent harnesses that kill child processes when a tool call returns. Without it, the script falls back to `setsid`.
 
-## Quick example
+## Quick ask
+```sh
+S=~/.claude/skills/agy-delegate/scripts/agy_job.py
+python3 $S ask --prompt "SQLite or JSON files for a small CLI todo app? Verdict first, then 3 reasons."
+python3 $S ask --prompt-file /tmp/review.md --context-dir ./src --json   # agy may read ./src, never write it
+```
+One `agy -p` run in a throwaway workspace with a timeout (default 600 s, model `gemini-4-neon-high`). Context dirs are added read-only (settings deny + fence hook + sandbox) and checked for changes afterwards. Prints the answer (or JSON with `state`, `conversation_id`, `tokens`, `blocked`, `context_changed`); `--conversation <id>` asks a follow-up.
+
+## Quick example (gated job)
 ```sh
 S=~/.claude/skills/agy-delegate/scripts/agy_job.py
 cd my-repo
@@ -33,7 +41,7 @@ python3 $S rework --job roman --feedback "from_roman must reject 'IIII'"   # sam
 python3 $S accept --job roman -m "Add roman numeral converter"            # commit on agy/roman, no push
 python3 $S cleanup --job roman              # remove worktree, keep branch
 ```
-Other commands: `list`, `stop`. Every command accepts `--json`.
+Other commands: `ask`, `list`, `stop`. Every command accepts `--json`.
 
 ## Where things go
 | What | Where |

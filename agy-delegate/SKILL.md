@@ -1,13 +1,32 @@
 ---
 name: agy-delegate
-description: Outsource a big, self-contained coding job to Google Antigravity CLI (`agy`, Gemini/Orchestrator models, optionally an agy /swarm of parallel workers) and act only as monitor and gate. Use when the user says to delegate or outsource work to agy, Antigravity or Gemini, "let agy do it", or wants a long, well-specified implementation run unattended in an isolated git worktree while you verify the result. Not for small edits you can do faster yourself.
+description: Use Google Antigravity CLI (`agy`, Gemini models) as a helper, from a quick question to a big gated coding job. Use when the user asks to get agy's or Gemini's opinion, a second opinion, a review or a brainstorm (quick read-only `ask`), or says to delegate or outsource work to agy, Antigravity or Gemini, "let agy do it", or wants a long, well-specified implementation run unattended in an isolated git worktree while you verify the result (`start` ... `gate` ... `accept`, single agent or agy /swarm). Not for small edits you can do faster yourself.
 ---
 
 # agy-delegate
 
-You are the **gate**, not the worker. agy does the coding in an isolated worktree on branch `agy/<job>`. You write the spec, **choose mode and model yourself**, launch, check status now and then, verify independently, and accept or send rework. Don't do the job yourself and don't babysit the run.
+All commands go through `scripts/agy_job.py`. Below, `J` means `python3 <this skill dir>/scripts/agy_job.py`. Add `--json` for machine-readable output. Two ways to use agy:
 
-All commands go through `scripts/agy_job.py`. Below, `J` means `python3 <this skill dir>/scripts/agy_job.py`. Run it from inside the target repo, or pass `--repo`. Add `--json` for machine-readable output.
+- **Quick ask** (section A): one question, opinion, review or brainstorm. No file changes, answer in under a few minutes.
+- **Gated job** (sections 1–7): agy writes code in an isolated worktree; you monitor and gate.
+
+## A. Quick ask (opinion / review / brainstorm, no file changes)
+```sh
+J ask --prompt-file /tmp/q.md                         # default model gemini-4-neon-high
+J ask --prompt "..." --model gemini-4-hydrogen-high   # simple factual question: fast and cheap
+J ask --prompt-file /tmp/q.md --context-dir ./src     # agy may READ ./src (repeatable), never write it
+J ask --prompt-file /tmp/q2.md --conversation <id>    # follow-up in the same agy conversation
+```
+- Write a self-contained prompt: the question, the context and constraints, and the output shape you want (e.g. "verdict first, then max 5 bullets with evidence"). agy sees nothing of your conversation.
+- Models: `gemini-4-hydrogen-high` simple; `gemini-4-neon-high` default for reviews and opinions; `gemini-4-carbon-medium` only for the hardest questions (slow, quota-heavy).
+- It runs in a fresh temp workspace (deleted afterwards) with a `--timeout` (default 600 s), and prints the answer on stdout; with `--json` you also get `state`, `conversation_id`, `tokens`, `blocked`, `context_changed`. Exit 0 ok, 1 failed/timeout/blocked/empty, 2 a context dir changed (should never happen; treat as an alarm and inspect).
+- Read-only is enforced three ways: per-run `--settings` deny `write_file(<context dir>)`, the fence hook (`--readonly`), and the terminal sandbox (context dirs are mounted read-only for commands). The script also snapshots each context dir before and after. No `--dangerously-skip-permissions`, no network.
+- Treat the answer as one opinion, not evidence: check its claims (file:line, numbers) before you rely on them, and ignore flattery.
+**Done when:** you have the answer (state `ok`) and have checked any claim you will act on.
+
+## B. Gated job
+
+You are the **gate**, not the worker. agy does the coding in an isolated worktree on branch `agy/<job>`. You write the spec, **choose mode and model yourself**, launch, check status now and then, verify independently, and accept or send rework. Don't do the job yourself and don't babysit the run. Run `J` from inside the target repo, or pass `--repo`.
 
 **Ask the user only for missing goals** (what to build, what "done" means). Never ask them about mode, model, budget, scope globs or spec wording: decide those yourself with the rubric below, and say what you picked in the report.
 
@@ -67,7 +86,7 @@ Model ids carry the effort level. Don't pass `--effort`, because agy rejects it.
 
 ## Safety model (read before loosening anything)
 - Per-job settings are passed with `--settings` and never written to agy's global settings. `--dangerously-skip-permissions` is never used.
-- Headless facts (agy 1.5.16, consumer account, see `tests/e2e.md`): print mode **really runs in auto mode**. The `--mode auto is not available ... rollout flag off` warning is printed before silent auth finishes and is wrong; agy's log then shows `jetski_mode_auto`. The script pins `--mode auto` and `status` reports the effective mode from agy's log. In auto mode, unlisted commands run **inside the terminal sandbox** (no network, `.git` read-only, most of `$HOME` hidden), and an LLM monitor reviews each step. `ask` rules are auto-denied, and `deny` rules return an error while agy carries on. `--agy-mode accept-edits` auto-denies every unlisted command headless, which makes it useless here.
+- Headless facts (agy 1.5.16, consumer account, see `tests/e2e.md`): `ask` and jobs pin `--mode auto`. `--mode plan` can read files but auto-denies every command headless, which can end the turn with an empty answer. Print mode **really runs in auto mode**. The `--mode auto is not available ... rollout flag off` warning is printed before silent auth finishes and is wrong; agy's log then shows `jetski_mode_auto`. The script pins `--mode auto` and `status` reports the effective mode from agy's log. In auto mode, unlisted commands run **inside the terminal sandbox** (no network, `.git` read-only, most of `$HOME` hidden), and an LLM monitor reviews each step. `ask` rules are auto-denied, and `deny` rules return an error while agy carries on. `--agy-mode accept-edits` auto-denies every unlisted command headless, which makes it useless here.
 - **Auto mode gaps that the fence closes:** a `BypassSandbox=true` command ran **outside** the sandbox even though the monitor flagged it, and auto mode lets file tools create files outside the workspace or edit other git repos. A command `allow` rule also lets that command leave the sandbox. So the template keeps `allow` empty (only a read-only grant on the git dir). `scripts/fence_hook.py` (installed as `.agents/hooks.json` in the worktree, never committed) denies sandbox bypass, network and remote tools, git push/commit/remote changes, sudo, file writes outside the worktree, reads of identity files (`~/.gitconfig`, `~/.git-credentials`, `~/.netrc`, `~/.npmrc`, `~/.pypirc`, `~/.docker/config.json`, `~/.ssh`, ...), and subagents or swarm workers with their own `share`/`branch` workspace.
 - Swarm workers and subagents load the same workspace hook and per-job settings. This was verified live: a worker's `curl` and `git push` were denied by the hook.
 - File rules must be absolute; the Linux sandbox rejects relative ones. `agy_job.py` makes them absolute for you. Keep that if you edit `templates/permissions.json`.

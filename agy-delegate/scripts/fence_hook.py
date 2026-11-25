@@ -19,7 +19,8 @@ independent fence:
 
 It runs for swarm workers and subagents too (they load the same workspace hooks).
 
-Usage (from hooks.json): python3 fence_hook.py --log <file> --root <worktree> [--log-all]
+Usage (from hooks.json): python3 fence_hook.py --log <file> --root <worktree> [--log-all] [--readonly <dir>]...
+(--readonly: extra workspace dirs, e.g. `ask --context-dir`, where file tools may read but never write)
 """
 import argparse
 import json
@@ -68,7 +69,7 @@ def secret_home_path(val):
     return False
 
 
-def decide(payload, root=None):
+def decide(payload, root=None, readonly=()):
     call = payload.get("toolCall") or {}
     name = call.get("name") or ""
     args = call.get("args") or {}
@@ -99,6 +100,9 @@ def decide(payload, root=None):
             path = os.path.realpath(val if os.path.isabs(val) else os.path.join(roots[0] if roots else os.getcwd(), val))
             if art and (path == art or path.startswith(art + os.sep)):
                 continue  # agy's own plan/walkthrough artifacts live here
+            ro = [os.path.realpath(r) for r in readonly]
+            if any(path == r or path.startswith(r + os.sep) for r in ro):
+                return "deny", "agy-delegate fence: this directory is read-only context"
             if roots and not any(path == r or path.startswith(r + os.sep) for r in roots):
                 return "deny", "agy-delegate fence: writing outside the job worktree is not allowed"
             rel = path
@@ -128,12 +132,13 @@ def main(argv=None):
     ap.add_argument("--log")
     ap.add_argument("--root")
     ap.add_argument("--log-all", action="store_true", help="log allowed calls too (used for swarm per-worker status)")
+    ap.add_argument("--readonly", action="append", default=[], help="directory file tools must not write (repeatable)")
     a = ap.parse_args(argv)
     try:
         payload = json.load(sys.stdin)
     except Exception:
         payload = {}
-    decision, reason = decide(payload, a.root)
+    decision, reason = decide(payload, a.root, a.readonly)
     if a.log and (decision == "deny" or a.log_all or os.environ.get("AGY_DELEGATE_HOOK_DEBUG")):
         try:
             call = payload.get("toolCall") or {}

@@ -527,5 +527,110 @@ class TestModes(Base):
         self.assertIsNone(agy_job.effective_agy_mode(self.tmp / "missing"))
 
 
+class TestAsk(Base):
+    def setUp(self):
+        super().setUp()
+        os.environ["TMPDIR"] = str(self.tmp)
+        self.ctx = self.tmp / "ctx"
+        self.ctx.mkdir()
+        (self.ctx / "calc.py").write_text("def avg(xs):\n    return sum(xs) / len(xs)\n")
+        import tempfile
+        tempfile.tempdir = None  # pick up TMPDIR
+
+    def tearDown(self):
+        import tempfile
+        super().tearDown()
+        tempfile.tempdir = None
+
+    def argv(self):
+        return json.loads((self.tmp / "argv.log").read_text().splitlines()[-1])
+
+    def test_plain_ask(self):
+        rc, out, err = self.cli("ask", "--prompt", "Is 42 the answer?", "--json")
+        self.assertEqual(rc, 0, out + err)
+        r = json.loads(out)
+        self.assertEqual(r["state"], "ok")
+        self.assertEqual(r["answer"], "All done.")
+        self.assertEqual(r["model"], agy_job.ASK_MODEL)
+        self.assertEqual(r["agy_mode"], "auto")
+        argv = self.argv()
+        self.assertNotIn("--dangerously-skip-permissions", argv)
+        self.assertIn("--disable-slash-commands", argv)
+        self.assertEqual(argv[argv.index("--mode") + 1], "auto")
+        self.assertIn("read-only consultation", argv[argv.index("-p") + 1])
+        self.assertEqual([p for p in self.tmp.iterdir() if p.name.startswith("agy-ask-")], [], "temp dir not removed")
+
+    def test_text_output_and_save(self):
+        q = self.tmp / "q.md"
+        q.write_text("question")
+        rc, out, err = self.cli("ask", "--prompt-file", str(q), "--model", "gemini-4-hydrogen-high", "--raw",
+                                "--save", str(self.tmp / "a.md"))
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(out.strip(), "All done.")
+        self.assertEqual((self.tmp / "a.md").read_text().strip(), "All done.")
+        argv = self.argv()
+        self.assertEqual(argv[argv.index("-p") + 1], "question")
+        self.assertEqual(argv[argv.index("--model") + 1], "gemini-4-hydrogen-high")
+
+    def test_context_dir_readonly_rules(self):
+        rc, out, err = self.cli("ask", "--prompt", "review calc.py", "--context-dir", str(self.ctx), "--json", "--keep")
+        self.assertEqual(rc, 0, out + err)
+        r = json.loads(out)
+        run_dir = Path(r["run_dir"])
+        argv = self.argv()
+        self.assertEqual(argv[argv.index("--add-dir") + 1], str(self.ctx.resolve()))
+        s = json.loads((run_dir / "settings.json").read_text())
+        self.assertIn("write_file(%s)" % self.ctx.resolve(), s["permissions"]["deny"])
+        self.assertEqual(s["permissions"]["allow"], [])
+        hook = (run_dir / "ws" / ".agents" / "hooks.json").read_text()
+        self.assertIn("--readonly", hook)
+        self.assertEqual(r["context_changed"], {})
+        shutil.rmtree(run_dir)
+
+    def test_context_change_detected(self):
+        os.environ["FAKE_AGY_WRITE"] = "%s=hacked" % (self.ctx / "calc.py")
+        rc, out, _ = self.cli("ask", "--prompt", "x", "--context-dir", str(self.ctx), "--json")
+        self.assertEqual(rc, agy_job.SCOPE)
+        r = json.loads(out)
+        self.assertEqual(r["state"], "context-changed")
+        self.assertEqual(r["context_changed"][str(self.ctx.resolve())], ["calc.py"])
+
+    def test_failure_and_blocked(self):
+        os.environ["FAKE_AGY_MODE"] = "fail"
+        rc, out, _ = self.cli("ask", "--prompt", "x", "--json")
+        self.assertEqual(rc, 1)
+        self.assertEqual(json.loads(out)["state"], "failed")
+        self.assertIn("model exploded", json.loads(out)["error"])
+        os.environ["FAKE_AGY_MODE"] = "denied"
+        rc, out, _ = self.cli("ask", "--prompt", "x", "--json")
+        self.assertEqual((rc, json.loads(out)["state"]), (1, "blocked"))
+
+    def test_timeout_kills(self):
+        os.environ["FAKE_AGY_MODE"] = "sleep"
+        os.environ["FAKE_AGY_SLEEP"] = "120"
+        t0, grace = time.time(), agy_job.ASK_GRACE_S
+        agy_job.ASK_GRACE_S = 0
+        try:
+            rc, out, _ = self.cli("ask", "--prompt", "x", "--json", "--timeout", "1")
+        finally:
+            agy_job.ASK_GRACE_S = grace
+        self.assertLess(time.time() - t0, 30)
+        self.assertEqual((rc, json.loads(out)["state"]), (1, "timeout"))
+
+    def test_prompt_args(self):
+        rc, _, err = self.cli("ask", "--json")
+        self.assertEqual(rc, agy_job.USAGE)
+        rc, _, err = self.cli("ask", "--prompt", "x", "--context-dir", str(self.tmp / "nope"))
+        self.assertEqual(rc, agy_job.USAGE)
+
+    def test_fence_readonly(self):
+        payload = {"toolCall": {"name": "edit_file", "args": {"TargetFile": str(self.ctx / "calc.py")}},
+                   "workspacePaths": [str(self.tmp / "ws"), str(self.ctx)]}
+        self.assertEqual(fence_hook.decide(payload, str(self.tmp / "ws"), [str(self.ctx)])[0], "deny")
+        self.assertEqual(fence_hook.decide(payload, str(self.tmp / "ws"))[0], "allow")
+        payload["toolCall"] = {"name": "read_file", "args": {"AbsolutePath": str(self.ctx / "calc.py")}}
+        self.assertEqual(fence_hook.decide(payload, str(self.tmp / "ws"), [str(self.ctx)])[0], "allow")
+
+
 if __name__ == "__main__":
     unittest.main()
