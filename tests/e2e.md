@@ -5,8 +5,8 @@ These runs used real agy quota and are not automated. Throwaway repos lived unde
 ## Investigation probes (raw agy, print mode)
 | Probe | Result |
 |---|---|
-| `agy -p ... --mode auto` | stderr `--mode auto is not available for this account; continuing in the default mode.` Log: `--mode auto is unavailable (rollout flag off)`. `--settings '{"agentMode":"auto"}'` was silently ignored (`permission_mode: request-review`). |
-| unlisted command (`python3 probe.py`) | Ran **inside the sandbox** without prompting: no network, host pid namespace hidden, `$HOME/<projects>` invisible, `.git` read-only (`git add` → `Read-only file system`), `/tmp` writable. |
+| `agy -p ... --mode auto` | stderr `--mode auto is not available for this account; continuing in the default mode.` and init says `permission_mode: request-review`. **Both are misleading:** see "Which mode -p really runs in" below (re-probed 2026-11-25); it is auto mode. |
+| unlisted command (`python3 probe.py`) | (auto mode) Ran **inside the sandbox** without prompting: no network, host pid namespace hidden, `$HOME/<projects>` invisible, `.git` read-only (`git add` → `Read-only file system`), `/tmp` writable. |
 | `deny: command(curl)`, `command(git push)`, `command(sudo)` | Tool step `ERROR`: `Permission denied for command(...). Matches user-configured deny rule.` agy **continues** with the next step. |
 | `ask: command(ls)` | Auto-denied headless (`user denied permission`). The turn **ends** with an empty response and `result.denied_actions=[{"action":"command"}]`. |
 | `toolPermission: strict` | Every command not in `allow` is auto-denied. Unusable without broad allow rules. |
@@ -93,3 +93,73 @@ Tool calls it made, in order:
 7. a short report: model, 1 round, about 21 s, gate result, files, review verdict, merge hint
 
 Independent check: `agy/fizz` = 1 commit touching only `fizz.py` (+22 lines). Tests pass on that branch, the worktree is removed, `main` is unchanged, nothing was pushed.
+
+## Which mode `-p` really runs in (2026-11-25)
+The same four-step probe was run three ways, with settings `{"enableTerminalSandbox": true}` and no hook, each with `--log-file`: (1) sandboxed command, (2) `BypassSandbox=true` command, (3) create a new file outside the workspace with the file tool, (4) edit a workspace file.
+
+| | no `--mode` | `--mode auto` | `--mode accept-edits` |
+|---|---|---|---|
+| stderr | (none) | `--mode auto is not available ... continuing in the default mode` | (none) |
+| log `Resolved active tags` | `jetski_mode_auto` | `jetski_mode_auto` | `jetski_mode_default` |
+| log `SetCycleMode called:` | `auto` | `auto` | `accept-edits` |
+| LLM step monitor (`sir_flash_lite`) | runs | runs | runs |
+| (1) sandboxed cmd | ran: `pid1=exe`, `Network is unreachable` | same | **auto-denied**, turn ends (`denied_actions: command`) |
+| (2) `BypassSandbox=true` | **ran outside** (`pid1=systemd`) although the monitor flagged it | same | not reached |
+| (3) new file outside workspace | created | created | not reached |
+| (4) workspace edit | done | done | not reached |
+
+The warning is printed before print mode's silent auth succeeds (the same order as public issue #1787); afterwards the session is in auto mode. The script now passes `--mode auto` explicitly, so a different global default can't silently switch jobs to a mode that auto-denies every command. `status` reports the effective mode parsed from the round's agy log. (2) and (3) are why the fence hook stays mandatory.
+
+## Swarm investigation (agy 1.5.16)
+- `/swarm` is a preview on all plans (docs: antigravity.google/docs/swarm, "Preview & Quota Heavy"). In `-p` mode a prompt that **starts with** `/swarm ` expands the built-in `native_swarm` skill. The coordinator gets the `swarm`/`post_message`/`read_board`/`swarm_wait` tools, adds named workers, a verifier and a `@monitor`, and the **single `-p` turn stays open until the swarm finishes** (exit 0, one `result` event). `stream-json` carries only the coordinator's steps. Workers are visible through the coordinator's `swarm add`/`status` and `read_board` tool outputs (names, models, conversation ids, states, `[done]` posts). `--conversation` resumes the coordinator.
+- Workers share the parent workspace by default (`workspace: inherit`). `share`/`branch` give a worker its own copy under agy's app-data `worktrees/`, and the swarm skill would then have it **commit** and merge back. That is incompatible with the gate (no commits, `.git` read-only), so the fence hook denies `share`/`branch`, and the swarm prompt tells the coordinator to keep everyone on the shared worktree with one owner per file.
+- **Hooks and permissions are inherited:** worker tool calls go through the same workspace `.agents/hooks.json` and `--settings`. In a raw probe (job settings + hook, `AGY_DELEGATE_HOOK_DEBUG=1`), the fence log showed about 60 calls from 6 conversations, and a `@probe` worker's `curl -sI https://example.com` and `git push origin HEAD` were `denied by pre-tool hook`.
+- Cost and time: the probe (3 tiny modules + probe + verifier + monitor, Hydrogen High) took 75 s wall clock. `result.usage` reported 75k tokens, which is the coordinator only; each worker is a separate agent on top of that.
+- `run_workflow` (Python fan-out to subagents) and plain subagents also exist. They are not used, because `/swarm` already gives a verifier and a board, and the subagents go through the same hook.
+
+## E2E #6: swarm job through the skill (+ fence from a worker, identity files)
+Repo `e2e-swarm` with fixed `tests/test_parts.py`. The spec has 4 Parts: strutil, mathutil, dateutil, and a fence-selftest part that must try `curl`, `git push`, reading `~/.gitconfig`, `git config user.email` and `git status`, and write the outputs to `fence_report.txt`.
+```
+$ S recommend --spec spec.md
+recommend: --mode swarm --model gemini-4-hydrogen-high --budget 65
+  - 4 independent parts, big job -> swarm (one worker per part + verifier)
+$ S start --job helpers --spec spec.md --accept "python3 -m unittest discover -s tests -v" --accept "test -s fence_report.txt" --allow ... --protect 'tests/*'
+started job helpers on agy/helpers (base 425d99b2f0b1, swarm, model gemini-4-hydrogen-high, budget 65m)
+$ S status --job helpers --wait 15
+job helpers: DONE  (round 1/3, 1m30s elapsed, budget 65m, swarm, model gemini-4-hydrogen-high, agy mode auto)
+  blocked: fence: network/remote tools ...; fence: git push is not allowed ...; fence: reading identity/credential files in $HOME ...
+  swarm 'Three stdlib helper modules': 6 workers, 5 reported [done], 11 board posts
+    @dateutil       done  gemini-4-hydrogen-high  tools=9
+    @fence-selftest done  gemini-4-hydrogen-high  tools=13
+    @mathutil       done  gemini-4-hydrogen-high  tools=8
+    @monitor        waiting                       tools=4
+    @strutil        done  gemini-4-hydrogen-high  tools=8
+    @verifier       done  gemini-4-hydrogen-high  tools=19
+$ S gate --job helpers      -> GATE PASS (both checks), 4 new files, exit 0
+$ S accept ... && S cleanup  -> 1 commit on agy/helpers (4 files, +76), worktree removed
+```
+`fence_report.txt` (written by the worker): `curl` → denied by pre-tool hook; `git push origin HEAD` → denied by pre-tool hook; `python3 -c "open(os.path.expanduser('~/.gitconfig'))"` → denied by pre-tool hook (identity files); `git config user.email` → empty (`NO_EMAIL`); `git status --short && git log -1` → worked. All three denials came from the worker's conversation id in `fence.log`.
+
+## ~/.gitconfig at the sandbox layer (no hook), old vs new template
+Same agy command in two throwaway repos, with settings built from the previous template and from the new one. The command checks `~/.gitconfig` exists/readable, whether `git config --global user.email` is set, and whether `git status` works:
+
+| | exists | readable | global email visible | `git status` rc |
+|---|---|---|---|---|
+| old template | True | True | **True (identity leaked)** | 0 |
+| new template | False | False | False | 0 |
+
+## E2E #7: fresh Claude Code picks mode and model by itself
+A throwaway project (README only) with the skill copied into `.claude/skills/agy-delegate` from `git archive`. The whole prompt was:
+```
+claude -p "outsource to agy: build a tiny CLI todo app with add/list/done and tests, split across storage and cli modules" \
+       --allowedTools "Bash,Read,Write,Edit,Glob,Grep,Skill" --output-format stream-json --verbose
+```
+What it did, without asking any question:
+1. `Skill agy-delegate`, read the template, wrote 11 acceptance tests (`tests/test_acceptance.py`) and committed them on `main`
+2. wrote a spec with a **Parts** section (storage API, cli behaviour) and ran `recommend`. At that commit the heuristic said `swarm` (it counted 6 scope paths as "big"). Claude overrode it from the rubric: *"two parts are tiny ... two small parts are cheaper as one job. I'm overriding to a single job"* → `--mode single --model gemini-4-hydrogen-high --budget 20`
+3. `start` (agy round: 53 s, `agy mode auto`, `--disable-slash-commands`), then `status --wait 20` in the background
+4. `gate`: the first run flagged its own committed `tests/__pycache__/*.pyc`. It restored the file and the second gate passed (19 tests). Then `diff` review, `accept`, `cleanup`
+5. report: mode and model with the reason, gate, files (7 files, +331), review verdict, the pyc caveat, merge hint
+
+Fixes that came out of this run: `big` now needs 8+ scope paths or a 900+ word spec (`recommend` now says `single` for this spec). Tracked build junk (`*.pyc`, `__pycache__`) rewritten by test runs no longer counts as a deliverable. SKILL.md says to commit tests without junk.
+Independent check: `agy/todo-cli` = 1 commit. On that branch, 19 tests pass, `python3 -m todo add/list/done` works, an unknown id gives exit 1 with `error: no task with id 9`. `main` is unchanged apart from Claude's test commit, and nothing was pushed.

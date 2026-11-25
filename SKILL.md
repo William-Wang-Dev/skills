@@ -12,7 +12,7 @@ All commands go through `scripts/agy_job.py`. Below, `J` means `python3 <this sk
 **Ask the user only for missing goals** (what to build, what "done" means). Never ask them about mode, model, budget, scope globs or spec wording: decide those yourself with the rubric below, and say what you picked in the report.
 
 ## 1. Write the job spec
-Copy `templates/job-spec.md` to a temp file outside the repo and fill in: goal, context, **scope** (the paths agy may change), **out of scope**, **acceptance commands** (objective, runnable, exit 0 = pass), and done criteria. If the acceptance tests don't exist yet, write or commit them first and protect them, so agy can't weaken them. When the job splits into independent pieces, fill **Parts**: one bullet per piece with its owner files and the interface it provides. Fix shared interfaces in the spec yourself, so no two parts have to co-design one.
+Copy `templates/job-spec.md` to a temp file outside the repo and fill in: goal, context, **scope** (the paths agy may change), **out of scope**, **acceptance commands** (objective, runnable, exit 0 = pass), and done criteria. If the acceptance tests don't exist yet, write and commit them first (without `__pycache__`/build junk) and protect them, so agy can't weaken them. When the job splits into independent pieces, fill **Parts**: one bullet per piece with its owner files and the interface it provides. Fix shared interfaces in the spec yourself, so no two parts have to co-design one.
 **Done when:** a stranger could do the job from the spec alone, and the acceptance commands fail now.
 
 ## 2. Choose mode and model yourself
@@ -22,9 +22,9 @@ Run `J recommend --spec /tmp/spec.md`. It reads Parts, Scope and keywords and pr
 |---|---|---|
 | Small, well specified, clear tests | single | `gemini-4-hydrogen-high` (fast, cheap) |
 | Hard but in one area (debugging, races, algorithms, perf) | single | `gemini-4-neon-high` (`-xhigh` if it already failed once) |
-| Big multi-file, or vague (refactor, design, migrate) | single | `gemini-pro-orchestrator-neon` (plans, then executes) |
+| Big (8+ scope paths or 900+ words) or vague (refactor, design, migrate) | single | `gemini-pro-orchestrator-neon` (plans, then executes) |
 | Hardest: hard **and** big or vague | single | `gemini-pro-orchestrator` (Carbon) |
-| 3+ independent Parts, or 2 big ones | swarm | `gemini-4-hydrogen-high` workers (`gemini-4-neon-high` if the parts are hard) |
+| 3+ independent Parts, or 2 Parts in a big job (8+ scope paths or a 900+ word spec) | swarm | `gemini-4-hydrogen-high` workers (`gemini-4-neon-high` if the parts are hard) |
 
 - **Swarm** = agy `/swarm`: a coordinator adds one worker per part plus a verifier and a stall monitor, all in the same worktree. It is faster on wall clock for broad work, but it uses several times the quota of one agent. Use it only when the parts really are independent (separate files, no shared interface to invent). Two small parts are cheaper as a single job.
 - Coupled work (one module, cross-cutting change, unclear split) always runs single, however big it is.

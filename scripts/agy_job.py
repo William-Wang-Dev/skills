@@ -330,7 +330,7 @@ def recommend(spec):
     scope = spec_items(spec, "Scope")
     hard = sorted({m.group(0).lower() for m in HARD_WORDS.finditer(text)})
     vague = sorted({m.group(0).lower() for m in VAGUE_WORDS.finditer(text)})
-    big = len(parts) >= 4 or len(scope) >= 6 or words >= 900
+    big = len(scope) >= 8 or words >= 900  # many files or a long spec
     why = []
     if len(parts) >= 3 or (len(parts) >= 2 and big):
         mode = "swarm"
@@ -730,7 +730,8 @@ def changed_files(d):
     for line in git(wt, "diff", "--name-status", "--no-renames", d["base_commit"]).splitlines():
         if line.strip():
             s, p = line.split("\t", 1)
-            out[p] = s[0]
+            if not matches(p, JUNK):  # e.g. a committed .pyc rewritten by a test run is not a deliverable
+                out[p] = s[0]
     for p in git(wt, "ls-files", "--others", "--exclude-standard").splitlines():
         if p.strip() and not matches(p, JUNK):
             out[p] = "A"

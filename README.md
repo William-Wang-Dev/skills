@@ -1,6 +1,6 @@
 # agy-delegate
 
-A Claude Code skill for handing a big, self-contained coding job to [Google Antigravity CLI](https://antigravity.google) (`agy`) while Claude acts only as **monitor and gate**. agy works in an isolated git worktree on branch `agy/<job>`, with per-job permission rules and a fence hook. Claude re-runs the acceptance checks itself, reviews the diff, and accepts the result or sends rework into the same agy conversation.
+A Claude Code skill for handing a big, self-contained coding job to [Google Antigravity CLI](https://antigravity.google) (`agy`) while Claude acts only as **monitor and gate**. Claude picks the run mode itself: a single agent (Hydrogen, Neon or an Orchestrator model) or an agy `/swarm` of parallel workers plus a verifier for jobs that split into independent parts. agy works in an isolated git worktree on branch `agy/<job>`, with per-job permission rules and a fence hook. Claude re-runs the acceptance checks itself, reviews the diff, and accepts the result or sends rework into the same agy conversation.
 
 ## Install
 ```sh
@@ -22,9 +22,10 @@ Claude Code discovers it via `SKILL.md`. Nothing else needs installing.
 S=~/.claude/skills/agy-delegate/scripts/agy_job.py
 cd my-repo
 cp ~/.claude/skills/agy-delegate/templates/job-spec.md /tmp/roman-spec.md   # fill it in
+python3 $S recommend --spec /tmp/roman-spec.md   # -> e.g. --mode single --model gemini-4-hydrogen-high --budget 20
 python3 $S start  --job roman --spec /tmp/roman-spec.md \
-                  --accept "python3 -m unittest discover -s tests" --allow roman.py --protect 'tests/*' \
-                  --model gemini-4-hydrogen-high --budget 30
+                  --accept "python3 -m unittest discover -s tests" --allow roman.py --protect 'tests/*'
+                  # --mode auto (default) applies the recommendation; or pass --mode single|swarm --model ... --budget ...
 python3 $S status --job roman --wait 20     # cheap; blocks until done/stuck/timeout or 20 min
 python3 $S gate   --job roman               # exit 0 pass / 1 fail / 2 scope violation / 3 not ready
 python3 $S diff   --job roman               # review everything, incl. new files
@@ -44,6 +45,15 @@ Other commands: `list`, `stop`. Every command accepts `--json`.
 
 Global agy settings are never modified. Per-job rules are passed with `agy --settings <file>`.
 
+## Modes
+| `--mode` | What runs | When |
+|---|---|---|
+| `single` | one agy agent; any model incl. `gemini-pro-orchestrator[-neon\|-argon]` | default for most jobs |
+| `swarm` | agy `/swarm` (preview): a coordinator, one worker per spec Part, a verifier and a stall monitor, all in the job worktree | 3+ independent Parts, or 2 big ones; uses several times the quota |
+| `auto` (default) | whatever `recommend` picks from the spec (Parts, Scope size, hard/vague keywords) | |
+
+`SKILL.md` has the decision rubric. For swarm jobs, `status` lists each worker's state, model, tool calls (from the fence hook log) and last board post.
+
 ## Environment variables
 `AGY_BIN` (agy path), `AGY_DELEGATE_WORKTREES` (worktree root), `AGY_DELEGATE_LAUNCHER` (`systemd` or `setsid`), `AGY_DELEGATE_GRACE_S` (seconds past the budget before the runner kills agy; default 120), `AGY_DELEGATE_HOOK_DEBUG=1` (the fence hook logs allowed calls as well as denials).
 
@@ -56,4 +66,5 @@ python3 -m unittest discover -s tests -v    # uses tests/fake_agy.py, no quota u
 ## Caveats
 - **Terms of service:** whether automated or third-party agents may drive `agy` on a consumer Google account is not clearly covered by public docs. Check the Antigravity / Google terms for your account type before using this at scale.
 - See "Safety model" in `SKILL.md`. In headless mode on consumer accounts, sandbox-bypass requests were auto-approved, and only the deny rules plus the fence hook stop them. Treat this as defense in depth, not a hard security boundary. Use it only on repos you'd let an agent touch.
-- `--mode auto` was not available on the tested account ("rollout flag off"), so jobs run in default mode with the sandbox on.
+- agy prints `--mode auto is not available for this account` in print mode, but on the tested account that warning is wrong (it is printed before silent auth finishes): `-p` runs really are in auto mode, as agy's own log shows (`jetski_mode_auto`). The script pins `--mode auto` and `status` shows the effective mode. Auto mode's sandbox-bypass and outside-workspace-write gaps are closed by the fence hook (see `SKILL.md`).
+- Swarm is a preview feature. Only the coordinator's token usage appears in agy's result; workers use quota on top of that.

@@ -381,11 +381,12 @@ class TestRecommend(unittest.TestCase):
         self.assertEqual((r["mode"], r["model"]), ("swarm", "gemini-4-neon-high"))
 
     def test_two_small_parts_stay_single(self):
-        r = agy_job.recommend(spec_with(["storage: store.py", "cli: cli.py"], scope=("store.py", "cli.py")))
+        # the E2E #7 case: 2 parts, 6 scope paths, short spec -> single
+        r = agy_job.recommend(spec_with(["storage: store.py", "cli: cli.py"], scope=["p%d.py" % i for i in range(6)]))
         self.assertEqual(r["mode"], "single")
 
     def test_two_parts_big_swarm(self):
-        r = agy_job.recommend(spec_with(["backend", "frontend"], scope=["f%d.py" % i for i in range(7)]))
+        r = agy_job.recommend(spec_with(["backend", "frontend"], scope=["f%d.py" % i for i in range(9)]))
         self.assertEqual(r["mode"], "swarm")
 
     def test_hard_single_neon_and_hardest_orchestrator(self):
@@ -499,6 +500,18 @@ class TestModes(Base):
         rc, out, _ = self.cli("gate", "--repo", str(self.repo), "--job", "j1")
         self.assertEqual(rc, agy_job.SCOPE, out)
         self.assertIn("sneaky", out)
+
+    def test_tracked_junk_ignored(self):
+        (self.repo / "tests" / "__pycache__").mkdir()
+        (self.repo / "tests" / "__pycache__" / "t.cpython-313.pyc").write_bytes(b"old")
+        sh("git", "add", "-f", "-A", cwd=self.repo)
+        sh("git", "commit", "-qm", "oops pyc", cwd=self.repo)
+        os.environ["FAKE_AGY_WRITE"] = "x.py=def f():\\n    return 42\\n;tests/__pycache__/t.cpython-313.pyc=new"
+        self.start()
+        self.wait_state()
+        rc, out, _ = self.cli("gate", "--repo", str(self.repo), "--job", "j1", "--json")
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(set(json.loads(out)["changed"]), {"x.py"})
 
     def test_identity_denies_in_settings(self):
         self.start("j1", "--dry-run")
