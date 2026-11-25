@@ -2,7 +2,7 @@
 """agy_job.py - delegate a self-contained coding job to Antigravity CLI (`agy`)
 and act as monitor + gate. Python 3 stdlib only; needs `git` and `agy`.
 
-Subcommands: start, status, gate, diff, rework, accept, stop, cleanup, list.
+Subcommands: recommend, start, status, gate, diff, rework, accept, stop, cleanup, list.
 Run `agy_job.py <cmd> -h` for options.
 
 Layout per job (nothing is written into the user's tracked tree except the
@@ -33,6 +33,11 @@ HOOK_REL = ".agents/hooks.json"
 PROGRESS = "PROGRESS.md"
 HOOK_KEY = "agy-delegate-fence"
 DEFAULT_MODEL = "gemini-4-hydrogen-high"
+# agy execution mode. Probed on agy 1.5.16 (tests/e2e.md): print mode really runs in auto mode whether or not
+# `--mode auto` is passed (the "not available ... rollout flag off" warning is printed before silent auth finishes
+# and is wrong). `accept-edits` auto-denies every unlisted command headless, so it is unusable without allow rules,
+# and allow rules let commands leave the sandbox. So we pin auto explicitly and keep the fence hook.
+DEFAULT_AGY_MODE = "auto"
 ALWAYS_FORBIDDEN = [".git", ".git/*", ".env", ".env.*", "*/.env", "*/.env.*", "*.pem", "*.key",
                     "id_rsa*", "*/id_rsa*", "id_ed25519*", "*/id_ed25519*"]
 # untracked build/test byproducts never count as deliverables (they are left out of scope checks and commits)
@@ -175,7 +180,7 @@ class Job:
 def parse_stream(path):
     """Summarise an agy stream-json log."""
     info = {"conversation_id": None, "events": 0, "tools": 0, "last": [], "result": None,
-            "errors": [], "model": None, "last_text": ""}
+            "errors": [], "model": None, "last_text": "", "swarm": None}
     text_buf = ""
     try:
         fh = open(path, errors="replace")
@@ -210,6 +215,8 @@ def parse_stream(path):
                 target = params.get("CommandLine") or params.get("TargetFile") or params.get("Path") or params.get("AbsolutePath") \
                     or params.get("DirectoryPath") or params.get("Query") or ""
                 desc = "%s %s" % (su.get("tool_name"), str(target)[:100])
+                if su.get("tool_name") in ("swarm", "read_board") and st == "DONE":
+                    swarm_event(info, su.get("tool_name"), params, ti.get("output"))
                 if st == "ERROR":
                     msg = ((ti.get("error") or {}).get("message") or "")[:200]
                     desc += "  [ERROR: %s]" % msg
@@ -224,6 +231,48 @@ def parse_stream(path):
                     info["last"] = info["last"][-8:]
                     text_buf = ""
     return info
+
+
+def tool_json(output):
+    """agy tool outputs are a few header lines followed by one JSON object."""
+    if isinstance(output, dict):
+        return output
+    for line in reversed(str(output or "").splitlines()):
+        if line.startswith("{"):
+            try:
+                return json.loads(line)
+            except ValueError:
+                return None
+    return None
+
+
+def swarm_event(info, tool, params, output):
+    """Track swarm members and board posts as the coordinator sees them."""
+    sw = info["swarm"] or {"title": None, "members": {}, "posts": 0}
+    info["swarm"] = sw
+    out = tool_json(output) or {}
+    mem = sw["members"]
+    if tool == "swarm":
+        if out.get("title"):
+            sw["title"] = out["title"]
+        if out.get("status") == "added" and out.get("name"):
+            mem.setdefault(out["name"], {}).update({"model": out.get("model"), "conversation_id": out.get("conversation_id"),
+                                                    "state": "added"})
+        for m in out.get("members") or []:
+            if m.get("name") and m.get("role") != "coordinator":
+                e = mem.setdefault(m["name"], {})
+                e["model"] = m.get("model") or e.get("model")
+                e["state"] = "killed" if m.get("killed") else m.get("state")
+    elif tool == "read_board":
+        for msg in out.get("messages") or []:
+            sw["posts"] = max(sw["posts"], int(msg.get("seq") or 0))
+            who = msg.get("agent")
+            if who and who != "coordinator":
+                e = mem.setdefault(who, {})
+                text = str(msg.get("text") or "")
+                e["last_post"] = text.replace("\n", " ")[:140]
+                if "[done]" in text.lower():
+                    e["done"] = True
 
 
 def agy_error(err_path):
@@ -241,6 +290,76 @@ def load_json_str(s):
         return json.loads(s)
     except ValueError:
         return {"short_error": s.strip()}
+
+
+# ---------------------------------------------------------------- mode / model recommendation
+HARD_WORDS = re.compile(r"\b(debug\w*|race|races|concurren\w*|deadlock\w*|flaky|perf\w*|optimi[sz]\w*|algorithm\w*|"
+                        r"root.cause|memory.leak|segfault|crash\w*|bisect)\b", re.I)
+VAGUE_WORDS = re.compile(r"\b(design|architect\w*|explore|investigate|figure out|refactor\w*|migrat\w*|redesign|"
+                         r"rewrite|overhaul|clean ?up|modernis\w*|moderniz\w*|tbd|unclear)\b", re.I)
+PLACEHOLDER = re.compile(r"<[^>]+>")
+
+
+def spec_section(spec, title):
+    """Lines of a '## <title>' section (until the next '## ' heading)."""
+    out, on = [], False
+    for line in spec.splitlines():
+        if re.match(r"^##\s", line):
+            on = bool(re.match(r"^##\s+%s\b" % re.escape(title), line, re.I))
+            continue
+        if on:
+            out.append(line)
+    return out
+
+
+def spec_items(spec, title):
+    """Top-level bullet / numbered items of a section, template placeholders ignored."""
+    items = []
+    for line in spec_section(spec, title):
+        m = re.match(r"^(?:[-*]|\d+[.)])\s+(.*\S)", line)
+        if m and PLACEHOLDER.sub("", m.group(1)).strip(" -.:`"):
+            items.append(m.group(1))
+    return items
+
+
+def recommend(spec):
+    """Pick mode + model + budget from simple spec signals. Deliberately crude; see SKILL.md."""
+    text = PLACEHOLDER.sub(" ", spec)
+    words = len(text.split())
+    parts = spec_items(spec, "Parts")
+    scope = spec_items(spec, "Scope")
+    hard = sorted({m.group(0).lower() for m in HARD_WORDS.finditer(text)})
+    vague = sorted({m.group(0).lower() for m in VAGUE_WORDS.finditer(text)})
+    big = len(parts) >= 4 or len(scope) >= 6 or words >= 900
+    why = []
+    if len(parts) >= 3 or (len(parts) >= 2 and big):
+        mode = "swarm"
+        why.append("%d independent parts%s -> swarm (one worker per part + verifier)" % (len(parts), ", big job" if big else ""))
+        model = "gemini-4-neon-high" if hard else "gemini-4-hydrogen-high"
+        why.append("workers inherit the model: %s" % ("neon-high for hard work (%s)" % ", ".join(hard) if hard
+                                                       else "hydrogen-high (fast, cheap, parts are well specified)"))
+        budget = min(90, 25 + 10 * len(parts))
+    else:
+        mode = "single"
+        if len(parts) == 2:
+            why.append("only 2 parts and not big -> single agent (a swarm's coordinator/verifier overhead is not worth it)")
+        elif len(parts) < 2:
+            why.append("no decomposed parts -> single agent")
+        if hard and (big or vague):
+            model, budget = "gemini-pro-orchestrator", 60
+            why.append("hard (%s) and %s -> Orchestrator (Carbon)" % (", ".join(hard), "big" if big else "vague"))
+        elif hard:
+            model, budget = "gemini-4-neon-high", 45
+            why.append("hard single-area work (%s) -> neon-high" % ", ".join(hard))
+        elif big or vague or not scope:
+            model, budget = "gemini-pro-orchestrator-neon", 45
+            why.append("%s -> Orchestrator (Neon) plans then executes" % (
+                "big multi-file job" if big else ("vague spec (%s)" % ", ".join(vague) if vague else "no explicit scope")))
+        else:
+            model, budget = DEFAULT_MODEL, 20
+            why.append("small, well-specified -> hydrogen-high")
+    return {"mode": mode, "model": model, "budget": budget, "parts": parts, "scope_items": len(scope),
+            "words": words, "hard": hard, "vague": vague, "big": big, "why": why}
 
 
 # ---------------------------------------------------------------- prompt
@@ -261,6 +380,26 @@ Acceptance command(s):
 {scope}
 ==== JOB SPEC ====
 {spec}
+"""
+
+SWARM = """
+==== SWARM RULES (you are the coordinator; apply to every worker and put them in every brief) ====
+- Every hard rule above applies to every worker: no commits, no network, no sandbox bypass, only in-scope files.
+- All workers use this shared workspace ({wt}) with the default workspace ("inherit"). Never give a worker a
+  "share" or "branch" workspace: nobody can commit here (.git is read-only), so changes made in a separate copy
+  would be lost, and the job's fence denies those workspaces anyway.
+- One owner per part and per file; no two workers edit the same file. {parts_line}
+- Add one verifier that runs the acceptance command(s) after the authors report [done] and sends failures back
+  to the owning worker. Only the verifier updates {progress}.
+- Keep the swarm small: at most {max_workers} workers besides the verifier and the monitor.
+- Do not end your final turn until the verifier has reported the acceptance command(s) passing, or you are sure
+  they cannot pass. Then reply with a short summary per worker (name, files, result).
+"""
+
+SWARM_REWORK = """
+You are still the swarm coordinator. Earlier workers may be gone: check `swarm` status, give each fix to its
+owning worker if it is still alive, otherwise add a fresh worker for it (same swarm rules as before: shared
+workspace only, one owner per file, no commits). Have the verifier re-run the acceptance command(s).
 """
 
 REWORK = """REWORK (round {n} of max {maxr}). The reviewer's gate found problems with your previous result in {wt}.
@@ -287,6 +426,18 @@ def scope_text(d):
 
 def accept_text(d):
     return "\n".join("  " + c for c in d["accept"]) or "  (none given)"
+
+
+def initial_prompt(d, spec):
+    p = PREAMBLE.format(wt=d["worktree"], progress=PROGRESS, accept=accept_text(d), scope=scope_text(d), spec=spec)
+    if d.get("mode") == "swarm":
+        parts = spec_items(spec, "Parts")
+        parts_line = ("Use the spec's Parts section as the split (one worker per part)." if parts
+                      else "Split by file or module so that pieces do not collide.")
+        # the slash command must be the very first token of the prompt for agy to start a swarm
+        p = "/swarm " + p + SWARM.format(wt=d["worktree"], progress=PROGRESS, parts_line=parts_line,
+                                         max_workers=max(2, min(8, len(parts) or 4)))
+    return p
 
 
 # ---------------------------------------------------------------- settings / hook
@@ -319,7 +470,7 @@ def install_hook(job, d):
                              "hooks": [{"type": "command", "timeout": 15,
                                         "command": " ".join(shlex.quote(x) for x in [
                                             sys.executable, str(FENCE_HOOK), "--log", str(job.dir / "fence.log"),
-                                            "--root", str(wt)])}]}]}
+                                            "--root", str(wt)] + (["--log-all"] if d.get("mode") == "swarm" else []))}]}]}
     tracked = bool(git(wt, "ls-files", HOOK_REL).strip())
     existing = load_json(hp, {}) if hp.exists() else {}
     if hp.exists() and not isinstance(existing, dict):
@@ -350,7 +501,13 @@ def launch_round(job, d, prompt, conversation=None):
     n = len(d["rounds"]) + 1
     budget_s = int(d["budget_min"] * 60)
     cmd = [agy_bin(), "-p", prompt, "--model", d["model"], "--output-format", "stream-json",
-           "--print-timeout", "%ds" % budget_s, "--settings", str(job.dir / "settings.json")]
+           "--print-timeout", "%ds" % budget_s, "--settings", str(job.dir / "settings.json"),
+           "--log-file", str(job.rpath(n, "agy.log"))]
+    if d.get("agy_mode", DEFAULT_AGY_MODE) != "default":
+        cmd += ["--mode", d.get("agy_mode", DEFAULT_AGY_MODE)]
+    if d.get("mode") != "swarm":
+        # single mode: a spec that happens to start with "/swarm" or "/boost" must not start a quota-heavy run
+        cmd.append("--disable-slash-commands")
     if conversation:
         cmd += ["--conversation", conversation]
     rnd = {"n": n, "started": now(), "cmd": cmd, "conversation_in": conversation,
@@ -453,7 +610,7 @@ def cmd__run(a):
 def evaluate(job, d):
     """Return a status dict for the latest round."""
     st = {"job": job.name, "repo": str(job.repo), "worktree": d["worktree"], "branch": d["branch"],
-          "model": d["model"], "round": len(d["rounds"]), "max_rounds": d["max_rounds"]}
+          "model": d["model"], "mode": d.get("mode", "single"), "round": len(d["rounds"]), "max_rounds": d["max_rounds"]}
     if not d["rounds"]:
         st["state"] = "new"
         return st
@@ -470,11 +627,26 @@ def evaluate(job, d):
                "last_events": info["last"][-5:], "budget_min": d["budget_min"]})
     res = info["result"]
     denied = (res or {}).get("denied_actions") or []
-    fence = []
+    fence, conv_tools = [], {}
     for line in (job.dir / "fence.log").read_text().splitlines() if (job.dir / "fence.log").exists() else []:
         e = load_json_str(line)
-        if e.get("ts", 0) >= rnd["started"] and e.get("decision", "deny") == "deny":
+        if e.get("ts", 0) < rnd["started"]:
+            continue
+        if e.get("conv"):
+            conv_tools[e["conv"]] = conv_tools.get(e["conv"], 0) + 1
+        if e.get("decision", "deny") == "deny":
             fence.append(e.get("reason", ""))
+    mode_eff = effective_agy_mode(job.rpath(n, "agy.log"))
+    if mode_eff:
+        st["agy_mode"] = mode_eff
+    if info["swarm"]:
+        sw = info["swarm"]
+        members = []
+        for name, m in sorted(sw["members"].items()):
+            m = dict(m, name=name, tools=conv_tools.get(m.get("conversation_id")))
+            members.append(m)
+        st["swarm"] = {"title": sw["title"], "posts": sw["posts"], "members": members,
+                       "done": sum(1 for m in members if m.get("done"))}
     st["blocked_actions"] = [x.get("action") for x in denied] + ["fence: " + f for f in fence] + \
         [e for e in info["errors"] if "permission" in e.lower() or "denied" in e.lower()][:5]
     if d.get("status_override") == "stopped" and not (ex is None and pid_alive(runner_pid(job, rnd))):
@@ -527,6 +699,19 @@ def evaluate(job, d):
     if d.get("last_gate"):
         st["last_gate"] = d["last_gate"]
     return st
+
+
+def effective_agy_mode(log_path):
+    """The mode agy really ran in, from its own log (`Resolved active tags: [jetski_mode_auto ...]`)."""
+    try:
+        with open(log_path, errors="replace") as fh:
+            for line in fh:
+                m = re.search(r"Resolved active tags: \[[^\]]*\bjetski_mode_(\w+)", line)
+                if m:
+                    return m.group(1)
+    except OSError:
+        pass
+    return None
 
 
 def tail(p, n):
@@ -589,6 +774,43 @@ def scope_violations(d, files):
 
 
 # ---------------------------------------------------------------- commands
+def repo_side_refs(repo):
+    """Worktrees and branches of the repo (to spot extra ones created during a job)."""
+    wts = [ln[9:] for ln in git(repo, "worktree", "list", "--porcelain").splitlines() if ln.startswith("worktree ")]
+    brs = git(repo, "for-each-ref", "--format=%(refname:short)", "refs/heads").split()
+    return sorted(wts), sorted(brs)
+
+
+def resolve_choice(a, spec):
+    """Fill in mode/model/budget: explicit flags win, `auto` takes the recommendation."""
+    rec = recommend(spec)
+    mode = rec["mode"] if a.mode == "auto" else a.mode
+    if a.model:
+        model = a.model
+    elif a.mode == "auto" or mode == rec["mode"]:
+        model = rec["model"]
+    else:  # caller forced a mode the heuristic did not pick: keep a sensible model for it
+        model = DEFAULT_MODEL if mode == "swarm" else rec["model"]
+    budget = a.budget if a.budget else (rec["budget"] if a.mode == "auto" else 45)
+    reason = "; ".join(rec["why"]) if a.mode == "auto" else "mode %s set by caller" % mode
+    return mode, model, budget, reason, rec
+
+
+def cmd_recommend(a):
+    spec = Path(a.spec).read_text()
+    rec = recommend(spec)
+    if a.json:
+        print(json.dumps(rec, indent=2))
+    else:
+        print("recommend: --mode %s --model %s --budget %d" % (rec["mode"], rec["model"], rec["budget"]))
+        print("  parts=%d scope_items=%d words=%d big=%s hard=%s vague=%s" % (
+            len(rec["parts"]), rec["scope_items"], rec["words"], rec["big"], ",".join(rec["hard"]) or "-",
+            ",".join(rec["vague"]) or "-"))
+        for w in rec["why"]:
+            print("  - " + w)
+    return OK
+
+
 def cmd_start(a):
     job = Job(a.repo, a.job)
     if job.exists():
@@ -596,6 +818,8 @@ def cmd_start(a):
     spec = Path(a.spec).read_text()
     if not spec.strip():
         raise JobError("spec file is empty")
+    mode, model, budget, reason, _rec = resolve_choice(a, spec)
+    a.model, a.budget = model, budget
     if not a.accept:
         raise JobError("give at least one --accept command (the gate needs something objective to run)")
     repo = job.repo
@@ -612,24 +836,25 @@ def cmd_start(a):
     try:
         git(repo, "worktree", "add", "-q", "-b", branch, str(wt), base)
         d = {"name": a.job, "repo": str(repo), "worktree": str(wt), "branch": branch, "base_commit": base,
-             "base_ref": a.base, "model": a.model, "accept": a.accept, "allow_paths": a.allow or [],
+             "base_ref": a.base, "model": a.model, "mode": mode, "mode_reason": reason, "agy_mode": a.agy_mode,
+             "side_refs": repo_side_refs(repo), "accept": a.accept, "allow_paths": a.allow or [],
              "protect": a.protect or [], "budget_min": a.budget, "stuck_min": a.stuck, "max_rounds": a.max_rounds,
              "created": now(), "rounds": [], "launcher": a.launcher, "grace_s": int(os.environ.get("AGY_DELEGATE_GRACE_S", "120")), "git_common_dir": str(common_dir(repo)), "dry_run": a.dry_run,
              "progress_tracked": bool(git(wt, "ls-files", PROGRESS).strip())}
         (job.dir / "spec.md").write_text(spec)
         save_json(job.dir / "settings.json", build_settings(d, a.permissions))
         install_hook(job, d)
-        prompt = PREAMBLE.format(wt=wt, progress=PROGRESS, accept=accept_text(d), scope=scope_text(d), spec=spec)
-        launch_round(job, d, prompt)
+        launch_round(job, d, initial_prompt(d, spec))
     except Exception:
         if not job.file.exists():
             shutil.rmtree(job.dir, ignore_errors=True)
         raise
     out = {"job": a.job, "worktree": str(wt), "branch": branch, "base": base[:12], "model": a.model,
-           "state_dir": str(job.dir), "dry_run": a.dry_run}
+           "mode": mode, "budget_min": budget, "why": reason, "state_dir": str(job.dir), "dry_run": a.dry_run}
     if dirty:
         out["warning"] = "main checkout has uncommitted changes; they are NOT in the job worktree (base=%s)" % a.base
-    emit(a, out, "started job %(job)s on %(branch)s (base %(base)s, model %(model)s)\n  worktree: %(worktree)s\n  state:    %(state_dir)s" % out
+    emit(a, out, ("started job %(job)s on %(branch)s (base %(base)s, %(mode)s, model %(model)s, budget %(budget_min)gm)\n"
+                  "  why:      %(why)s\n  worktree: %(worktree)s\n  state:    %(state_dir)s") % out
          + ("\n  WARNING: " + out["warning"] if dirty else "")
          + "\nnext: %s status --job %s --wait 20   (run it in the background)" % (Path(__file__).name, a.job))
     return OK
@@ -652,15 +877,24 @@ def cmd_status(a):
 
 
 def render_status(st, verbose=False):
-    lines = ["job %s: %s  (round %s/%s, %s elapsed, budget %sm, model %s)" % (
+    lines = ["job %s: %s  (round %s/%s, %s elapsed, budget %sm, %s, model %s%s)" % (
         st["job"], st["state"].upper(), st.get("round"), st.get("max_rounds"), fmt_dur(st.get("elapsed_s", 0)),
-        st.get("budget_min"), st.get("model"))]
+        st.get("budget_min"), st.get("mode", "single"), st.get("model"),
+        ", agy mode %s" % st["agy_mode"] if st.get("agy_mode") else "")]
     if st.get("reason"):
         lines.append("  reason: " + st["reason"])
     lines.append("  tools: %s  changed files: %s  conversation: %s" % (
         st.get("tool_calls"), st.get("changed_files"), st.get("conversation_id")))
     if st.get("blocked_actions"):
         lines.append("  blocked: " + "; ".join(str(x) for x in st["blocked_actions"][:5]))
+    sw = st.get("swarm")
+    if sw:
+        lines.append("  swarm %r: %d workers, %d reported [done], %d board posts" % (
+            sw.get("title") or "", len(sw["members"]), sw["done"], sw["posts"]))
+        for m in sw["members"]:
+            lines.append("    @%-12s %-8s %-24s tools=%-4s %s" % (
+                m["name"], "done" if m.get("done") else (m.get("state") or "?"), m.get("model") or "",
+                m.get("tools") if m.get("tools") is not None else "-", (m.get("last_post") or "")[:80 if not verbose else 140]))
     if st.get("last_events"):
         lines.append("  recent:")
         lines += ["    - " + e for e in st["last_events"]]
@@ -695,6 +929,13 @@ def cmd_gate(a):
     head = git(wt, "rev-parse", "HEAD").strip()
     if head != d["base_commit"] and not d.get("accepted"):
         viol.append("worktree HEAD moved from base (%s -> %s): agent created commits" % (d["base_commit"][:10], head[:10]))
+    if d.get("side_refs"):
+        wts, brs = repo_side_refs(job.repo)
+        new_wt = [w for w in wts if w not in d["side_refs"][0] and w != d["worktree"]]
+        new_br = [b for b in brs if b not in d["side_refs"][1] and b != d["branch"]]
+        if new_wt or new_br:
+            viol.append("extra worktrees/branches appeared during the job (work done there is not in the gated "
+                        "worktree): %s" % ", ".join(new_wt + new_br))
     files = deliverable_files(d)
     viol += scope_violations(d, files)
     res["changed"] = files
@@ -791,9 +1032,10 @@ def cmd_rework(a):
     n = len(d["rounds"]) + 1
     prompt = REWORK.format(n=n, maxr=d["max_rounds"], wt=d["worktree"], feedback=fb.strip(),
                            progress=PROGRESS, accept=accept_text(d))
+    if d.get("mode") == "swarm":
+        prompt += SWARM_REWORK
     if not cid:  # previous round never got a conversation: start over with full context
-        prompt = PREAMBLE.format(wt=d["worktree"], progress=PROGRESS, accept=accept_text(d), scope=scope_text(d),
-                                 spec=(job.dir / "spec.md").read_text()) + "\n\n" + prompt
+        prompt = initial_prompt(d, (job.dir / "spec.md").read_text()) + "\n\n" + prompt
     rnd = launch_round(job, d, prompt, conversation=cid)
     emit(a, {"job": job.name, "round": rnd["n"], "conversation": cid},
          "rework round %d launched for %s (conversation %s)" % (rnd["n"], job.name, cid or "new"))
@@ -918,12 +1160,12 @@ def cmd_list(a):
     for p in sorted(root.glob("*/job.json")) if root.exists() else []:
         job = Job(a.repo, p.parent.name)
         st = evaluate(job, job.load())
-        rows.append({k: st.get(k) for k in ("job", "state", "round", "model", "branch", "elapsed_s", "last_gate", "accepted")})
+        rows.append({k: st.get(k) for k in ("job", "state", "mode", "round", "model", "branch", "elapsed_s", "last_gate", "accepted")})
     if a.json:
         print(json.dumps(rows, indent=2))
     else:
         for r in rows:
-            print("%-24s %-9s round %s  %-28s %s  gate=%s%s" % (r["job"], r["state"], r["round"], r["model"], r["branch"],
+            print("%-24s %-9s %-6s round %s  %-28s %s  gate=%s%s" % (r["job"], r["state"], r["mode"], r["round"], r["model"], r["branch"],
                                                               r["last_gate"], "  accepted" if r["accepted"] else ""))
         if not rows:
             print("no jobs")
@@ -946,11 +1188,22 @@ def build_parser():
         p.add_argument("--json", action="store_true", help="machine-readable output")
         return p
 
+    p = common(sub.add_parser("recommend", help="suggest --mode/--model/--budget from a job spec (no side effects)"), job=False)
+    p.add_argument("--spec", required=True, help="job spec markdown file")
+    p.set_defaults(fn=cmd_recommend)
+
     p = common(sub.add_parser("start", help="create worktree + branch and launch agy in the background"))
     p.add_argument("--spec", required=True, help="job spec markdown file (see templates/job-spec.md)")
     p.add_argument("--accept", action="append", help="acceptance shell command run in the worktree (repeatable)")
-    p.add_argument("--model", default=DEFAULT_MODEL, help="agy model id (default %s); effort is part of the id" % DEFAULT_MODEL)
-    p.add_argument("--budget", type=float, default=45, help="time budget per round, minutes (default 45)")
+    p.add_argument("--mode", choices=["auto", "single", "swarm"], default="auto",
+                   help="single agent, agy /swarm (coordinator + parallel workers + verifier), or auto (default): "
+                        "take `recommend`'s pick from the spec")
+    p.add_argument("--model", help="agy model id; effort is part of the id (default: recommended for the spec, "
+                                   "else %s). In swarm mode the workers inherit it" % DEFAULT_MODEL)
+    p.add_argument("--budget", type=float, help="time budget per round, minutes (default: recommended with --mode auto, else 45)")
+    p.add_argument("--agy-mode", choices=["auto", "accept-edits", "default"], default=DEFAULT_AGY_MODE,
+                   help="agy execution mode (default auto; `default` passes no --mode). accept-edits auto-denies every "
+                        "unlisted command headless")
     p.add_argument("--stuck", type=float, default=12, help="minutes without output before status says stuck (default 12)")
     p.add_argument("--max-rounds", type=int, default=3, help="max rounds incl. the first (default 3)")
     p.add_argument("--allow", action="append", help="glob of paths the agent may change (repeatable; default: any)")

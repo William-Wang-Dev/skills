@@ -1,5 +1,5 @@
 {
-  "_comment": "Per-job agy settings, passed with `agy --settings <file>`; never written to the global settings.json. `~` is expanded and `{GIT_COMMON_DIR}` is filled in by agy_job.py. Keep `allow` minimal: on consumer accounts an allow rule also lets that command run OUTSIDE the terminal sandbox. Unlisted commands run inside the sandbox (no network, .git read-only), and `ask` is auto-denied in headless mode.",
+  "_comment": "Per-job agy settings, passed with `agy --settings <file>`; never written to the global settings.json. `~` is expanded and `{GIT_COMMON_DIR}` is filled in by agy_job.py. Keep `allow` minimal: an allow rule also lets that command run OUTSIDE the terminal sandbox. In auto mode (what -p really runs in) unlisted commands run inside the terminal sandbox (no network, .git read-only) and `ask` is auto-denied headless. read_file denies also hide the path inside the sandbox; denying a path that does not exist is fine.",
   "enableTerminalSandbox": true,
   "permissions": {
     "allow": [
@@ -30,6 +30,17 @@
       "write_file(~/.ssh)",
       "read_file(~/.gnupg)",
       "read_file(~/.git-credentials)",
+      "read_file(~/.gitconfig)",
+      "write_file(~/.gitconfig)",
+      "read_file(~/.netrc)",
+      "read_file(~/.npmrc)",
+      "read_file(~/.pypirc)",
+      "read_file(~/.docker/config.json)",
+      "read_file(~/.aws)",
+      "read_file(~/.kube)",
+      "read_file(~/.cargo/credentials)",
+      "read_file(~/.cargo/credentials.toml)",
+      "read_file(~/.gem/credentials)",
       "read_file(~/.claude)",
       "read_file(~/.config)",
       "execute_url(*)"

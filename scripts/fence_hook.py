@@ -12,8 +12,14 @@ independent fence:
   * no sandbox bypass at all
   * no network / remote / privilege commands anywhere in a command line
   * no file-tool writes outside the job worktree or into protected paths
+    (auto mode would otherwise allow new files anywhere and edits in other repos)
+  * no file-tool reads of identity/credential files in $HOME (~/.gitconfig, ~/.netrc, ...)
+  * no subagent / swarm worker with its own `share` or `branch` workspace (they would
+    work outside the gated worktree and need commits)
 
-Usage (from hooks.json): python3 fence_hook.py --log <file> --root <worktree>
+It runs for swarm workers and subagents too (they load the same workspace hooks).
+
+Usage (from hooks.json): python3 fence_hook.py --log <file> --root <worktree> [--log-all]
 """
 import argparse
 import json
@@ -36,6 +42,12 @@ DENY_COMMAND_PATTERNS = [
 
 PROTECTED_PARTS = (".git", ".agents")
 SENSITIVE_NAMES = re.compile(r"(^|/)(\.env(\..*)?|id_rsa.*|id_ed25519.*|.*\.pem|.*\.key)$")
+# identity / credential files under $HOME that a delegated job never needs to read
+SECRET_HOME = (".gitconfig", ".git-credentials", ".netrc", ".npmrc", ".pypirc", ".docker/config.json", ".ssh",
+               ".gnupg", ".aws", ".kube", ".config", ".cargo/credentials", ".cargo/credentials.toml",
+               ".gem/credentials", ".claude", ".claude.json", ".gemini/oauth_creds.json")
+SECRET_CMD = re.compile(r"(~|\$HOME|\$\{HOME\}|" + re.escape(os.path.expanduser("~")) + r")/(\.gitconfig|\.git-credentials|"
+                        r"\.netrc|\.npmrc|\.pypirc|\.docker/config\.json|\.ssh|\.gnupg|\.aws|\.kube|\.cargo/credentials)")
 WRITE_TOOLS = {"write_to_file", "write_file", "replace_file_content", "multi_replace_file_content", "edit_file",
                "sed_file", "notebook_edit"}
 
@@ -44,10 +56,29 @@ def is_write_tool(name):
     return name in WRITE_TOOLS or any(k in name for k in ("write", "replace", "edit", "sed_"))
 
 
+def secret_home_path(val):
+    if not isinstance(val, str) or not val:
+        return False
+    home = os.path.realpath(os.path.expanduser("~"))
+    p = os.path.realpath(os.path.expanduser(val))
+    for s in SECRET_HOME:
+        t = os.path.join(home, s)
+        if p == t or p.startswith(t + os.sep):
+            return True
+    return False
+
+
 def decide(payload, root=None):
     call = payload.get("toolCall") or {}
     name = call.get("name") or ""
     args = call.get("args") or {}
+    ws = str(args.get("workspace") or args.get("Workspace") or "").lower()
+    if ws in ("share", "branch"):
+        return "deny", ("agy-delegate fence: subagents/workers must use the shared job workspace (workspace "
+                        "'inherit'); separate 'share'/'branch' copies are not gated and would need commits")
+    for key, val in args.items():
+        if (key.endswith("Path") or key.endswith("File") or key in ("path", "file")) and secret_home_path(val):
+            return "deny", "agy-delegate fence: reading or writing identity/credential files in $HOME is not allowed"
     if name == "run_command":
         if args.get("BypassSandbox"):
             return "deny", "agy-delegate fence: running outside the sandbox is not allowed for delegated jobs"
@@ -55,6 +86,8 @@ def decide(payload, root=None):
         for pat, reason in DENY_COMMAND_PATTERNS:
             if re.search(pat, cmd):
                 return "deny", "agy-delegate fence: " + reason
+        if SECRET_CMD.search(cmd):
+            return "deny", "agy-delegate fence: reading identity/credential files in $HOME is not allowed"
         return "allow", ""
     if is_write_tool(name) and not name.startswith("browser"):
         roots = [os.path.realpath(r) for r in ([root] if root else []) + list(payload.get("workspacePaths") or [])]
@@ -81,23 +114,36 @@ def decide(payload, root=None):
     return "allow", ""
 
 
+def conversation_of(payload):
+    """Best-effort id of the calling conversation (main agent, subagent or swarm worker)."""
+    for k, v in payload.items():
+        if "onversation" in k and isinstance(v, str) and v:
+            return v
+    art = payload.get("artifactDirectoryPath") or ""
+    return os.path.basename(art.rstrip("/")) if art else None
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("--log")
     ap.add_argument("--root")
+    ap.add_argument("--log-all", action="store_true", help="log allowed calls too (used for swarm per-worker status)")
     a = ap.parse_args(argv)
     try:
         payload = json.load(sys.stdin)
     except Exception:
         payload = {}
     decision, reason = decide(payload, a.root)
-    if a.log and (decision == "deny" or os.environ.get("AGY_DELEGATE_HOOK_DEBUG")):
+    if a.log and (decision == "deny" or a.log_all or os.environ.get("AGY_DELEGATE_HOOK_DEBUG")):
         try:
             call = payload.get("toolCall") or {}
+            rec = {"ts": time.time(), "tool": call.get("name"),
+                   "args": {k: str(v)[:300] for k, v in (call.get("args") or {}).items()},
+                   "decision": decision, "reason": reason, "conv": conversation_of(payload)}
+            if os.environ.get("AGY_DELEGATE_HOOK_DEBUG"):
+                rec["payload_keys"] = sorted(payload)
             with open(a.log, "a") as fh:
-                fh.write(json.dumps({"ts": time.time(), "tool": call.get("name"),
-                                     "args": {k: str(v)[:300] for k, v in (call.get("args") or {}).items()},
-                                     "decision": decision, "reason": reason}) + "\n")
+                fh.write(json.dumps(rec) + "\n")
         except OSError:
             pass
     out = {"decision": decision}

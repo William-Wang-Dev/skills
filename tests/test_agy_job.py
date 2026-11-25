@@ -286,7 +286,7 @@ class TestLifecycle(Base):
 
 
 class TestFenceHook(unittest.TestCase):
-    def d(self, name, root="/w", **args):
+    def d(self, name, root="/w", /, **args):
         return fence_hook.decide({"toolCall": {"name": name, "args": args}, "workspacePaths": [root],
                                   "artifactDirectoryPath": "/home/u/.gemini/x/brain/c1"}, root)[0]
 
@@ -319,6 +319,199 @@ class TestFenceHook(unittest.TestCase):
         p = subprocess.run([sys.executable, str(HERE.parent / "scripts" / "fence_hook.py")], text=True, capture_output=True,
                            input=json.dumps({"toolCall": {"name": "run_command", "args": {"CommandLine": "curl x"}}}))
         self.assertEqual(json.loads(p.stdout)["decision"], "deny")
+
+    def test_identity_files_denied(self):
+        home = os.path.expanduser("~")
+        for f in (".gitconfig", ".git-credentials", ".netrc", ".npmrc", ".pypirc", ".docker/config.json", ".ssh/id_ed25519"):
+            self.assertEqual(self.d("read_file", Path=os.path.join(home, f)), "deny", f)
+            self.assertEqual(self.d("view_file", AbsolutePath="~/" + f), "deny", f)
+        for c in ("cat ~/.gitconfig", "cat $HOME/.netrc", "cp %s/.npmrc /tmp/x" % home, "ls ~/.ssh"):
+            self.assertEqual(self.d("run_command", CommandLine=c), "deny", c)
+        # agy reads its own built-in skills under ~/.gemini; normal git still works
+        self.assertEqual(self.d("read_file", Path=os.path.join(home, ".gemini/antigravity-cli/builtin/skills/x/SKILL.md")), "allow")
+        self.assertEqual(self.d("run_command", CommandLine="git log --oneline -3"), "allow")
+
+    def test_separate_workspaces_denied(self):
+        self.assertEqual(self.d("swarm", action="add", name="w", brief="x", workspace="share"), "deny")
+        self.assertEqual(self.d("invoke_subagent", workspace="branch", prompt="x"), "deny")
+        self.assertEqual(self.d("swarm", action="add", name="w", brief="x", workspace="inherit"), "allow")
+        self.assertEqual(self.d("swarm", action="add", name="w", brief="x"), "allow")
+
+    def test_log_all_records_conversation(self):
+        with tempfile.TemporaryDirectory() as t:
+            log = os.path.join(t, "f.log")
+            payload = {"toolCall": {"name": "read_file", "args": {"Path": "/w/a"}},
+                       "artifactDirectoryPath": "/h/.gemini/brain/conv-7/"}
+            subprocess.run([sys.executable, str(HERE.parent / "scripts" / "fence_hook.py"), "--log", log, "--root", "/w",
+                            "--log-all"], input=json.dumps(payload), text=True, capture_output=True, check=True)
+            rec = json.loads(Path(log).read_text())
+            self.assertEqual((rec["decision"], rec["conv"]), ("allow", "conv-7"))
+
+
+SPEC_SMALL = """# Job: roman
+## Goal
+Implement to_roman/from_roman in roman.py so the fixed tests pass.
+## Scope (may change)
+- roman.py (new)
+## Acceptance
+python3 -m unittest
+"""
+
+
+def spec_with(parts=(), extra="", scope=("roman.py",)):
+    s = "# Job\n## Goal\nBuild things. %s\n## Scope (may change)\n%s\n" % (extra, "\n".join("- " + x for x in scope))
+    if parts:
+        s += "## Parts\n" + "\n".join("- %s" % p for p in parts) + "\n"
+    return s + "## Acceptance\npython3 -m unittest\n"
+
+
+class TestRecommend(unittest.TestCase):
+    def test_small_single_hydrogen(self):
+        r = agy_job.recommend(SPEC_SMALL)
+        self.assertEqual((r["mode"], r["model"]), ("single", "gemini-4-hydrogen-high"))
+
+    def test_three_parts_swarm(self):
+        r = agy_job.recommend(spec_with(["storage: store.py", "cli: cli.py", "docs: README.md"]))
+        self.assertEqual((r["mode"], r["model"]), ("swarm", "gemini-4-hydrogen-high"))
+        self.assertEqual(len(r["parts"]), 3)
+        self.assertLessEqual(r["budget"], 90)
+
+    def test_hard_swarm_uses_neon(self):
+        r = agy_job.recommend(spec_with(["a", "b", "c"], extra="Fix the race condition in each worker pool."))
+        self.assertEqual((r["mode"], r["model"]), ("swarm", "gemini-4-neon-high"))
+
+    def test_two_small_parts_stay_single(self):
+        r = agy_job.recommend(spec_with(["storage: store.py", "cli: cli.py"], scope=("store.py", "cli.py")))
+        self.assertEqual(r["mode"], "single")
+
+    def test_two_parts_big_swarm(self):
+        r = agy_job.recommend(spec_with(["backend", "frontend"], scope=["f%d.py" % i for i in range(7)]))
+        self.assertEqual(r["mode"], "swarm")
+
+    def test_hard_single_neon_and_hardest_orchestrator(self):
+        self.assertEqual(agy_job.recommend(spec_with(extra="Debug the deadlock in pool.py."))["model"], "gemini-4-neon-high")
+        r = agy_job.recommend(spec_with(extra="Debug the deadlock and redesign the scheduler architecture."))
+        self.assertEqual((r["mode"], r["model"]), ("single", "gemini-pro-orchestrator"))
+
+    def test_vague_or_big_orchestrator_neon(self):
+        self.assertEqual(agy_job.recommend(spec_with(extra="Refactor the config loading."))["model"],
+                         "gemini-pro-orchestrator-neon")
+        self.assertEqual(agy_job.recommend(spec_with(scope=["m%d.py" % i for i in range(8)]))["model"],
+                         "gemini-pro-orchestrator-neon")
+
+    def test_template_placeholders_ignored(self):
+        tpl = (HERE.parent / "templates" / "job-spec.md").read_text()
+        self.assertEqual(agy_job.spec_items(tpl, "Parts"), [])
+        self.assertEqual(agy_job.spec_items(tpl, "Scope"), [])
+
+    def test_numbered_parts(self):
+        s = "## Parts\n1. one\n2) two\n   - nested detail\n3. three\n## Next\n- not a part\n"
+        self.assertEqual(agy_job.spec_items(s, "Parts"), ["one", "two", "three"])
+
+
+class TestModes(Base):
+    def argv(self, i=0):
+        deadline = time.time() + 15
+        while time.time() < deadline:
+            p = self.tmp / "argv.log"
+            if p.exists() and len(p.read_text().splitlines()) > i:
+                break
+            time.sleep(0.1)
+        return json.loads((self.tmp / "argv.log").read_text().splitlines()[i])
+
+    def test_recommend_cli(self):
+        self.spec.write_text(spec_with(["a: a.py", "b: b.py", "c: c.py"]))
+        rc, out, _ = self.cli("recommend", "--spec", str(self.spec), "--json")
+        self.assertEqual(rc, 0)
+        self.assertEqual(json.loads(out)["mode"], "swarm")
+
+    def test_single_auto_flags(self):
+        os.environ["FAKE_AGY_WRITE"] = "x.py=def f():\\n    return 42\\n"
+        self.spec.write_text(SPEC_SMALL)
+        rc, out, err = self.start("j1", "--json")
+        self.assertEqual(rc, 0, err)
+        o = json.loads(out)
+        self.assertEqual((o["mode"], o["model"], o["budget_min"]), ("single", "gemini-4-hydrogen-high", 20))
+        st = self.wait_state()
+        a = self.argv()
+        self.assertFalse(a[a.index("-p") + 1].startswith("/swarm"))
+        self.assertIn("--disable-slash-commands", a)
+        self.assertEqual(a[a.index("--mode") + 1], "auto")
+        self.assertIn("--log-file", a)
+        self.assertEqual(st["agy_mode"], "auto")
+        self.assertNotIn("--log-all", (self.wt() / ".agents" / "hooks.json").read_text())
+
+    def test_explicit_flags_win(self):
+        self.spec.write_text(SPEC_SMALL)
+        rc, out, err = self.start("j1", "--mode", "swarm", "--model", "gemini-4-neon-high", "--budget", "7",
+                                  "--agy-mode", "default", "--dry-run", "--json")
+        o = json.loads(out)
+        self.assertEqual((o["mode"], o["model"], o["budget_min"]), ("swarm", "gemini-4-neon-high", 7))
+        d = agy_job.Job(str(self.repo), "j1").load()
+        self.assertNotIn("--mode", d["rounds"][0]["cmd"])
+
+    def test_swarm_job_status_gate_rework(self):
+        os.environ["FAKE_AGY_MODE"] = "swarm"
+        os.environ["FAKE_AGY_WORKERS"] = "storage,cli"
+        os.environ["FAKE_AGY_WRITE"] = "x.py=def f():\\n    return 42\\n"
+        self.spec.write_text(spec_with(["storage: x.py", "cli: cli.py", "docs: README.md"]))
+        rc, out, err = self.start("j1", "--json")
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(json.loads(out)["mode"], "swarm")
+        a = self.argv()
+        prompt = a[a.index("-p") + 1]
+        self.assertTrue(prompt.startswith("/swarm "), prompt[:40])
+        self.assertIn("SWARM RULES", prompt)
+        self.assertIn("Parts section", prompt)
+        self.assertNotIn("--disable-slash-commands", a)
+        self.assertIn("--log-all", (self.wt() / ".agents" / "hooks.json").read_text())
+        st = self.wait_state()
+        self.assertEqual(st["state"], "done", st)
+        # simulate hook log lines from two worker conversations
+        jd = self.repo / ".git" / "agy-jobs" / "j1"
+        with open(jd / "fence.log", "a") as fh:
+            for conv in ("conv-storage", "conv-storage", "conv-cli"):
+                fh.write(json.dumps({"ts": time.time(), "tool": "run_command", "decision": "allow", "conv": conv}) + "\n")
+        rc, out, _ = self.cli("status", "--repo", str(self.repo), "--job", "j1", "--json")
+        sw = json.loads(out)["swarm"]
+        m = {x["name"]: x for x in sw["members"]}
+        self.assertEqual(set(m), {"storage", "cli", "verifier"})
+        self.assertEqual((m["storage"]["tools"], m["cli"]["tools"]), (2, 1))
+        self.assertTrue(m["storage"]["done"] and m["cli"]["done"])
+        self.assertEqual(sw["done"], 2)
+        rc, out, _ = self.cli("status", "--repo", str(self.repo), "--job", "j1")
+        self.assertIn("@storage", out)
+        self.assertIn("2 reported [done]", out)
+        rc, out, _ = self.cli("gate", "--repo", str(self.repo), "--job", "j1")
+        self.assertEqual(rc, 0, out)
+        rc, out, err = self.cli("rework", "--repo", str(self.repo), "--job", "j1", "--feedback", "add docstrings")
+        self.assertEqual(rc, 0, err)
+        self.wait_state()
+        a2 = self.argv(1)
+        self.assertIn("--conversation", a2)
+        self.assertIn("still the swarm coordinator", a2[a2.index("-p") + 1])
+
+    def test_gate_flags_extra_branch(self):
+        os.environ["FAKE_AGY_WRITE"] = "x.py=def f():\\n    return 42\\n"
+        self.start()
+        self.wait_state()
+        sh("git", "branch", "sneaky", cwd=self.repo)
+        rc, out, _ = self.cli("gate", "--repo", str(self.repo), "--job", "j1")
+        self.assertEqual(rc, agy_job.SCOPE, out)
+        self.assertIn("sneaky", out)
+
+    def test_identity_denies_in_settings(self):
+        self.start("j1", "--dry-run")
+        s = json.loads((self.repo / ".git" / "agy-jobs" / "j1" / "settings.json").read_text())
+        home = str(Path.home())
+        for f in (".gitconfig", ".git-credentials", ".netrc", ".npmrc", ".pypirc", ".docker/config.json"):
+            self.assertIn("read_file(%s/%s)" % (home, f), s["permissions"]["deny"])
+
+    def test_effective_mode_parse(self):
+        p = self.tmp / "l.log"
+        p.write_text("x\nI1 monitoring.go:411] [Sonar] Resolved active tags: [jetski_mode_default policy_guardian]\n")
+        self.assertEqual(agy_job.effective_agy_mode(p), "default")
+        self.assertIsNone(agy_job.effective_agy_mode(self.tmp / "missing"))
 
 
 if __name__ == "__main__":
