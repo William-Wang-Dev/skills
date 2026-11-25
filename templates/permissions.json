@@ -1,0 +1,39 @@
+{
+  "_comment": "Per-job agy settings, passed with `agy --settings <file>`; never written to the global settings.json. `~` is expanded and `{GIT_COMMON_DIR}` is filled in by agy_job.py. Keep `allow` minimal: on consumer accounts an allow rule also lets that command run OUTSIDE the terminal sandbox. Unlisted commands run inside the sandbox (no network, .git read-only), and `ask` is auto-denied in headless mode.",
+  "enableTerminalSandbox": true,
+  "permissions": {
+    "allow": [
+      "read_file({GIT_COMMON_DIR})"
+    ],
+    "deny": [
+      "command(sudo)",
+      "command(su)",
+      "command(doas)",
+      "command(curl)",
+      "command(wget)",
+      "command(ssh)",
+      "command(scp)",
+      "command(sftp)",
+      "command(rsync)",
+      "command(nc)",
+      "command(git push)",
+      "command(git remote)",
+      "command(git config --global)",
+      "command(git config --system)",
+      "command(regex:rm +-[a-zA-Z]* +(/|~|\\$HOME).*)",
+      "write_file(.git/)",
+      "write_file(.agents/)",
+      "write_file({GIT_COMMON_DIR})",
+      "write_file(.env)",
+      "read_file(.env)",
+      "read_file(~/.ssh)",
+      "write_file(~/.ssh)",
+      "read_file(~/.gnupg)",
+      "read_file(~/.git-credentials)",
+      "read_file(~/.claude)",
+      "read_file(~/.config)",
+      "execute_url(*)"
+    ],
+    "ask": []
+  }
+}
